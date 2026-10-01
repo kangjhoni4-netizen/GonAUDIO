@@ -1,4 +1,5 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import JSZip from "jszip";
 import "./App.css";
 
 import {
@@ -16,21 +17,184 @@ const PRESETS = [
   { name: "CUSTOM", speed: "Manual" },
 ];
 
+const DEFAULT_CUSTOM_RATE = "0.43";
+const CUSTOM_MIN = 0.01;
+const CUSTOM_MAX = 20;
+const MAX_FILES = 50;
+
+function createId(file, index) {
+  return `${file.name}-${file.size}-${file.lastModified}-${index}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+}
+
+function getBaseName(fileName) {
+  return (
+    fileName
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[^\w\- ]/g, "")
+      .trim() || "audio"
+  );
+}
+
+function Waveform({ file }) {
+  const [bars, setBars] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    let audioContext = null;
+
+    const buildWaveform = async () => {
+      setLoading(true);
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+
+        if (cancelled) return;
+
+        audioContext = new AudioContext();
+        const audioBuffer = await audioContext.decodeAudioData(
+          arrayBuffer.slice(0)
+        );
+
+        if (cancelled) return;
+
+        const channelCount = audioBuffer.numberOfChannels;
+        const length = audioBuffer.length;
+        const barCount = 56;
+        const samplesPerBar = Math.max(1, Math.floor(length / barCount));
+        const output = [];
+
+        for (let bar = 0; bar < barCount; bar += 1) {
+          const start = bar * samplesPerBar;
+          const end = Math.min(
+            length,
+            start + samplesPerBar
+          );
+
+          let peak = 0;
+
+          for (let channel = 0; channel < channelCount; channel += 1) {
+            const data = audioBuffer.getChannelData(channel);
+
+            for (let i = start; i < end; i += 1) {
+              peak = Math.max(peak, Math.abs(data[i]));
+            }
+          }
+
+          output.push(Math.max(0.08, peak));
+        }
+
+        if (!cancelled) {
+          setBars(output);
+        }
+      } catch {
+        if (!cancelled) {
+          setBars([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+
+        if (audioContext) {
+          try {
+            await audioContext.close();
+          } catch {
+            // Ignore close errors.
+          }
+        }
+      }
+    };
+
+    buildWaveform();
+
+    return () => {
+      cancelled = true;
+      if (audioContext) {
+        try {
+          audioContext.close();
+        } catch {
+          // Ignore close errors.
+        }
+      }
+    };
+  }, [file]);
+
+  if (loading) {
+    return <div className="waveform waveform-loading" />;
+  }
+
+  if (!bars.length) {
+    return <div className="waveform waveform-empty" />;
+  }
+
+  return (
+    <div
+      className="waveform"
+      aria-label={`Waveform ${file.name}`}
+    >
+      {bars.map((value, index) => (
+        <span
+          key={`${file.name}-${index}`}
+          style={{ height: `${Math.max(12, value * 100)}%` }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function PreviewAudio({ file }) {
+  const [src, setSrc] = useState("");
+
+  useEffect(() => {
+    const url = URL.createObjectURL(file);
+    setSrc(url);
+
+    return () => {
+      URL.revokeObjectURL(url);
+    };
+  }, [file]);
+
+  if (!src) {
+    return null;
+  }
+
+  return (
+    <audio
+      className="preview-audio"
+      controls
+      preload="metadata"
+      src={src}
+    />
+  );
+}
+
 function App() {
   const fileInputRef = useRef(null);
+  const cancelRef = useRef(false);
+  const pauseRef = useRef(false);
+  const pauseWaitersRef = useRef([]);
 
-  const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedFiles, setSelectedFiles] = useState([]);
   const [selectedPreset, setSelectedPreset] = useState(0);
-  const [customRobloxRate, setCustomRobloxRate] = useState("0.43");
+  const [customRobloxRate, setCustomRobloxRate] = useState(
+    DEFAULT_CUSTOM_RATE
+  );
   const [dragging, setDragging] = useState(false);
 
   const [processing, setProcessing] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [processedFile, setProcessedFile] = useState(null);
+  const [totalProgress, setTotalProgress] = useState(0);
+  const [processingIndex, setProcessingIndex] = useState(0);
+  const [batchResults, setBatchResults] = useState([]);
   const [error, setError] = useState("");
+  const [previewFileId, setPreviewFileId] = useState(null);
 
   const preset = PRESETS[selectedPreset];
-
   const parsedCustomRobloxRate = Number(customRobloxRate);
 
   const activeRobloxRate =
@@ -38,69 +202,228 @@ function App() {
       ? parsedCustomRobloxRate
       : Number(preset.speed);
 
-  const activeProcessingSpeed =
-    1 / activeRobloxRate;
+  const activeProcessingSpeed = 1 / activeRobloxRate;
 
-  const handleFile = (file) => {
-    if (!file) return;
+  useEffect(() => {
+    return () => {
+      pauseWaitersRef.current.forEach((resolve) => resolve());
+      pauseWaitersRef.current = [];
+    };
+  }, []);
 
-    const validAudio =
-      file.type.startsWith("audio/") ||
-      /\.(mp3|wav|ogg|flac|m4a|mp4)$/i.test(file.name);
+  const isValidAudio = (file) => {
+    return (
+      file &&
+      (file.type.startsWith("audio/") ||
+        /\.(mp3|wav|ogg|flac|m4a|mp4)$/i.test(file.name))
+    );
+  };
 
-    if (!validAudio) {
-      setError("Silakan pilih file audio yang didukung.");
-      return;
-    }
+  const addFiles = (fileList) => {
+    const incoming = Array.from(fileList || []);
+    if (!incoming.length) return;
 
-    setSelectedFile(file);
-    setProcessedFile(null);
-    setError("");
+    const audioFiles = incoming.filter(isValidAudio);
+    const invalidCount = incoming.length - audioFiles.length;
+
+    setError(
+      invalidCount
+        ? `${invalidCount} file tidak didukung dan dilewati.`
+        : ""
+    );
+
+    setSelectedFiles((current) => {
+      const existingKeys = new Set(
+        current.map(
+          (item) =>
+            `${item.file.name}-${item.file.size}-${item.file.lastModified}`
+        )
+      );
+
+      const additions = audioFiles
+        .filter(
+          (file) =>
+            !existingKeys.has(
+              `${file.name}-${file.size}-${file.lastModified}`
+            )
+        )
+        .slice(0, Math.max(0, MAX_FILES - current.length))
+        .map((file, index) => ({
+          id: createId(file, current.length + index),
+          file,
+        }));
+
+      const next = [...current, ...additions];
+
+      if (
+        current.length + audioFiles.length > MAX_FILES &&
+        !invalidCount
+      ) {
+        setError(`Maksimal ${MAX_FILES} audio per batch.`);
+      }
+
+      return next;
+    });
+
+    setBatchResults([]);
     setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
   };
 
   const handleInputChange = (event) => {
-    handleFile(event.target.files?.[0]);
-
-    // Memungkinkan memilih file yang sama kembali
+    addFiles(event.target.files);
     event.target.value = "";
+  };
+
+  const openFilePicker = () => {
+    if (!processing) {
+      fileInputRef.current?.click();
+    }
   };
 
   const handleDrop = (event) => {
     event.preventDefault();
     setDragging(false);
 
-    handleFile(event.dataTransfer.files?.[0]);
+    if (!processing) {
+      addFiles(event.dataTransfer.files);
+    }
   };
 
-  const openFilePicker = () => {
-    fileInputRef.current?.click();
-  };
+  const removeFile = (id) => {
+    if (processing) return;
 
-  const formatSize = (bytes) => {
-    if (!bytes) return "0 KB";
+    setSelectedFiles((current) =>
+      current.filter((item) => item.id !== id)
+    );
 
-    const mb = bytes / 1024 / 1024;
-
-    if (mb >= 1) {
-      return `${mb.toFixed(2)} MB`;
+    if (previewFileId === id) {
+      setPreviewFileId(null);
     }
 
-    return `${Math.max(
-      1,
-      Math.round(bytes / 1024)
-    )} KB`;
+    setBatchResults([]);
+    setError("");
+    setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
+  };
+
+  const clearFiles = () => {
+    if (processing) return;
+
+    setSelectedFiles([]);
+    setPreviewFileId(null);
+    setBatchResults([]);
+    setError("");
+    setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
   };
 
   const handlePresetChange = (index) => {
+    if (processing) return;
+
     setSelectedPreset(index);
-    setProcessedFile(null);
+    setBatchResults([]);
     setError("");
     setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
+  };
+
+  const updateCustomRate = (value) => {
+    setCustomRobloxRate(value);
+    setBatchResults([]);
+    setError("");
+    setProgress(0);
+    setTotalProgress(0);
+  };
+
+  const waitWhilePaused = async () => {
+    while (pauseRef.current && !cancelRef.current) {
+      await new Promise((resolve) => {
+        pauseWaitersRef.current.push(resolve);
+      });
+    }
+
+    if (cancelRef.current) {
+      const error = new Error("Batch processing dibatalkan.");
+      error.name = "AbortError";
+      throw error;
+    }
+  };
+
+  const resumePauseWaiters = () => {
+    const waiters = pauseWaitersRef.current.splice(0);
+    waiters.forEach((resolve) => resolve());
+  };
+
+  const pauseBatch = () => {
+    if (!processing) return;
+
+    pauseRef.current = true;
+    setPaused(true);
+  };
+
+  const resumeBatch = () => {
+    pauseRef.current = false;
+    setPaused(false);
+    resumePauseWaiters();
+  };
+
+  const cancelBatch = () => {
+    if (!processing) return;
+
+    cancelRef.current = true;
+    pauseRef.current = false;
+    setCancelRequested(true);
+    setPaused(false);
+    resumePauseWaiters();
+  };
+
+  const downloadAllAsZip = async () => {
+    const doneResults = batchResults.filter(
+      (item) => item.status === "done" && item.blob
+    );
+
+    if (!doneResults.length) {
+      setError("Belum ada hasil OGG yang bisa dimasukkan ke ZIP.");
+      return;
+    }
+
+    try {
+      setError("");
+
+      const zip = new JSZip();
+
+      doneResults.forEach((item) => {
+        zip.file(item.outputName, item.blob);
+      });
+
+      const zipBlob = await zip.generateAsync({
+        type: "blob",
+        compression: "DEFLATE",
+        compressionOptions: { level: 6 },
+      });
+
+      downloadBlob(
+        zipBlob,
+        `GonAUDIO_${PRESETS[selectedPreset].name.replace(
+          /\s+/g,
+          "_"
+        )}_BATCH.zip`
+      );
+    } catch (err) {
+      console.error(err);
+      setError(
+        err?.message || "Gagal membuat file ZIP."
+      );
+    }
   };
 
   const handleProcess = async () => {
-    if (!selectedFile) {
+    if (!selectedFiles.length) {
       setError("Upload audio terlebih dahulu.");
       return;
     }
@@ -109,60 +432,189 @@ function App() {
       return;
     }
 
-    setError("");
-    setProcessedFile(null);
+    if (
+      !Number.isFinite(activeRobloxRate) ||
+      activeRobloxRate <= 0 ||
+      !Number.isFinite(activeProcessingSpeed) ||
+      activeProcessingSpeed <= 0
+    ) {
+      setError("Target playback rate Roblox tidak valid.");
+      return;
+    }
+
+    cancelRef.current = false;
+    pauseRef.current = false;
+
     setProcessing(true);
+    setPaused(false);
+    setCancelRequested(false);
+    setError("");
     setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
+
+    const initialResults = selectedFiles.map((item) => ({
+      id: item.id,
+      fileName: item.file.name,
+      outputName: "",
+      status: "waiting",
+      size: 0,
+      blob: null,
+      error: "",
+    }));
+
+    setBatchResults(initialResults);
+
+    const safePresetName = preset.name.replace(/\s+/g, "_");
 
     try {
-      const robloxPlaybackRate =
-        activeRobloxRate;
+      for (let index = 0; index < selectedFiles.length; index += 1) {
+        await waitWhilePaused();
 
-      const processingSpeed =
-        activeProcessingSpeed;
+        if (cancelRef.current) {
+          break;
+        }
 
-      if (
-        !Number.isFinite(robloxPlaybackRate) ||
-        robloxPlaybackRate <= 0 ||
-        !Number.isFinite(processingSpeed) ||
-        processingSpeed <= 0
-      ) {
-        throw new Error(
-          "Target playback rate Roblox tidak valid."
+        const item = selectedFiles[index];
+        const file = item.file;
+
+        setProcessingIndex(index);
+        setBatchResults((current) =>
+          current.map((result) =>
+            result.id === item.id
+              ? {
+                  ...result,
+                  status: "processing",
+                  error: "",
+                }
+              : result
+          )
         );
+
+        setProgress(0);
+        setTotalProgress(
+          Math.round((index / selectedFiles.length) * 100)
+        );
+
+        try {
+          const result = await processAudio(
+            file,
+            activeProcessingSpeed,
+            (fileProgress) => {
+              const numericProgress = Number(fileProgress) || 0;
+
+              setProgress(numericProgress);
+
+              const batchProgress =
+                ((index + numericProgress / 100) /
+                  selectedFiles.length) *
+                100;
+
+              setTotalProgress(
+                Math.min(100, Math.round(batchProgress))
+              );
+            },
+            {
+              signal: {
+                get aborted() {
+                  return cancelRef.current;
+                },
+              },
+            }
+          );
+
+          if (cancelRef.current) {
+            break;
+          }
+
+          const outputName = `${getBaseName(
+            file.name
+          )}_GonAUDIO_${safePresetName}.ogg`;
+
+          setBatchResults((current) =>
+            current.map((resultItem) =>
+              resultItem.id === item.id
+                ? {
+                    ...resultItem,
+                    status: "done",
+                    outputName,
+                    size: result.size,
+                    blob: result.blob,
+                    error: "",
+                  }
+                : resultItem
+            )
+          );
+        } catch (fileError) {
+          if (fileError?.name === "AbortError") {
+            break;
+          }
+
+          console.error(fileError);
+
+          setBatchResults((current) =>
+            current.map((resultItem) =>
+              resultItem.id === item.id
+                ? {
+                    ...resultItem,
+                    status: "error",
+                    error:
+                      fileError?.message ||
+                      "Terjadi kesalahan saat memproses audio.",
+                  }
+                : resultItem
+            )
+          );
+        }
       }
 
-      const result = await processAudio(
-        selectedFile,
-        processingSpeed,
-        setProgress
-      );
+      if (cancelRef.current) {
+        setBatchResults((current) =>
+          current.map((item) =>
+            item.status === "waiting" || item.status === "processing"
+              ? {
+                  ...item,
+                  status: "cancelled",
+                }
+              : item
+          )
+        );
 
-      setProcessedFile(result);
-
-      const baseName = selectedFile.name
-        .replace(/\.[^/.]+$/, "")
-        .replace(/[^\w\- ]/g, "")
-        .trim() || "audio";
-
-      const safePresetName =
-        preset.name.replace(/\s+/g, "_");
-
-      downloadBlob(
-        result.blob,
-        `${baseName}_GonAUDIO_${safePresetName}.ogg`
-      );
+        setTotalProgress((current) => current);
+        setError("Batch processing dibatalkan.");
+      } else {
+        setProgress(100);
+        setTotalProgress(100);
+      }
     } catch (err) {
-      console.error(err);
-
-      setError(
-        err?.message ||
-          "Terjadi kesalahan saat memproses audio."
-      );
+      if (err?.name === "AbortError") {
+        setError("Batch processing dibatalkan.");
+      } else {
+        console.error(err);
+        setError(
+          err?.message ||
+            "Terjadi kesalahan saat memproses batch audio."
+        );
+      }
     } finally {
       setProcessing(false);
+      setPaused(false);
+      setCancelRequested(false);
+      setProcessingIndex(0);
+      pauseRef.current = false;
+      cancelRef.current = false;
+      resumePauseWaiters();
     }
   };
+
+  const activePreviewItem =
+    selectedFiles.find((item) => item.id === previewFileId) || null;
+
+  const doneCount = batchResults.filter(
+    (item) => item.status === "done"
+  ).length;
+
+  const hasDoneResults = doneCount > 0;
 
   return (
     <div className="app">
@@ -170,13 +622,11 @@ function App() {
       <div className="background-glow glow-two" />
 
       <main className="container">
-
         {/* HERO */}
         <section className="hero">
-
           <div className="version-badge">
             <span className="badge-dot" />
-            AUDIO PROCESSING V1.0
+            AUDIO PROCESSING V2.0
           </div>
 
           <h1>
@@ -190,61 +640,42 @@ function App() {
             <br />
             YANG DISESUAIKAN — DIBUAT UNTUK WORKFLOW AUDIO ROBLOX
           </p>
-
         </section>
 
         {/* MAIN WORKSPACE */}
         <section className="workspace">
-
-          {/* UPLOAD */}
+          {/* UPLOAD + BATCH PREVIEW */}
           <div className="upload-section">
-
             <div
-              className={`upload-box ${
-                dragging ? "dragging" : ""
+              className={`upload-box ${dragging ? "dragging" : ""} ${
+                selectedFiles.length ? "has-files" : ""
               }`}
               onDragOver={(event) => {
                 event.preventDefault();
-                setDragging(true);
+
+                if (!processing) {
+                  setDragging(true);
+                }
               }}
               onDragLeave={() => setDragging(false)}
               onDrop={handleDrop}
               onClick={openFilePicker}
             >
-
               <input
                 ref={fileInputRef}
                 type="file"
                 accept=".mp3,.wav,.ogg,.flac,.m4a,.mp4,audio/*"
                 onChange={handleInputChange}
+                multiple
                 hidden
               />
 
-              <div className="upload-icon" />
-
-              <h2>
-                {selectedFile
-                  ? "Audio Selected"
-                  : "Upload your audio"}
-              </h2>
-
-              {selectedFile ? (
+              {selectedFiles.length === 0 ? (
                 <>
-                  <div className="selected-file">
+                  <div className="upload-icon" />
 
-                    <strong>
-                      {selectedFile.name}
-                    </strong>
+                  <h2>Upload your audio</h2>
 
-                    <span>
-                      {formatSize(selectedFile.size)}
-                    </span>
-
-                  </div>
-
-                </>
-              ) : (
-                <>
                   <p>
                     Drag & drop atau klik di sini untuk{" "}
                     <span>browse</span>
@@ -259,58 +690,151 @@ function App() {
                     MP4
                   </div>
                 </>
+              ) : (
+                <div
+                  className="batch-upload-content"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div className="batch-upload-top">
+                    <div>
+                      <strong>
+                        {selectedFiles.length} AUDIO SELECTED
+                      </strong>
+
+                      <small>
+                        Maksimal {MAX_FILES} file per batch
+                      </small>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="add-more-button"
+                      onClick={openFilePicker}
+                      disabled={processing}
+                    >
+                      + ADD MORE
+                    </button>
+                  </div>
+
+                  <div className="selected-files">
+                    {selectedFiles.map((item) => (
+                      <div
+                        className={`selected-file ${
+                          previewFileId === item.id
+                            ? "preview-active"
+                            : ""
+                        }`}
+                        key={item.id}
+                      >
+                        <button
+                          type="button"
+                          className="file-main"
+                          onClick={() =>
+                            setPreviewFileId((current) =>
+                              current === item.id
+                                ? null
+                                : item.id
+                            )
+                          }
+                          title="Preview audio"
+                        >
+                          <span className="file-play-icon">
+                            {previewFileId === item.id
+                              ? "❚❚"
+                              : "▶"}
+                          </span>
+
+                          <span className="file-text">
+                            <strong title={item.file.name}>
+                              {item.file.name}
+                            </strong>
+
+                            <small>
+                              {formatBytes(item.file.size)}
+                            </small>
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          className="remove-file"
+                          onClick={() => removeFile(item.id)}
+                          disabled={processing}
+                          aria-label={`Remove ${item.file.name}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+
+                  {activePreviewItem && (
+                    <div
+                      className="batch-preview"
+                      onClick={(event) =>
+                        event.stopPropagation()
+                      }
+                    >
+                      <div className="batch-preview-header">
+                        <strong>PREVIEW</strong>
+
+                        <span>
+                          {activePreviewItem.file.name}
+                        </span>
+                      </div>
+
+                      <Waveform file={activePreviewItem.file} />
+
+                      <PreviewAudio
+                        file={activePreviewItem.file}
+                      />
+                    </div>
+                  )}
+
+                  <div className="upload-actions">
+                    <button
+                      type="button"
+                      className="clear-files-button"
+                      onClick={clearFiles}
+                      disabled={processing}
+                    >
+                      CLEAR ALL
+                    </button>
+                  </div>
+                </div>
               )}
-
             </div>
-
           </div>
 
           {/* SETTINGS */}
           <div className="settings-section">
-
             {/* PRESETS */}
             <div className="presets">
-
               {PRESETS.map((item, index) => (
-
                 <button
                   key={item.name}
                   type="button"
                   className={`preset-card ${
-                    selectedPreset === index
-                      ? "active"
-                      : ""
+                    selectedPreset === index ? "active" : ""
                   }`}
-                  onClick={() =>
-                    handlePresetChange(index)
-                  }
+                  onClick={() => handlePresetChange(index)}
                   disabled={processing}
                 >
-
                   <span className="preset-number">
                     {index + 1}
                   </span>
 
-                  <strong>
-                    {item.name}
-                  </strong>
+                  <strong>{item.name}</strong>
 
-                  <small>
-                    {item.speed}
-                  </small>
-
+                  <small>{item.speed}</small>
                 </button>
-
               ))}
-
             </div>
 
             {selectedPreset === 5 && (
               <div className="custom-settings">
                 <div className="custom-settings-header">
-                  <div>
-                    <strong>CUSTOM ROBLOX PLAYBACK RATE</strong>
-                  </div>
+                  <strong>CUSTOM ROBLOX PLAYBACK RATE</strong>
 
                   <div className="custom-rate-value">
                     {Number.isFinite(parsedCustomRobloxRate) &&
@@ -324,21 +848,24 @@ function App() {
                   <input
                     className="custom-slider"
                     type="range"
-                    min="0.01"
-                    max="20"
+                    min={CUSTOM_MIN}
+                    max={CUSTOM_MAX}
                     step="0.01"
                     value={
                       Number.isFinite(parsedCustomRobloxRate) &&
                       parsedCustomRobloxRate > 0
-                        ? parsedCustomRobloxRate
+                        ? Math.min(
+                            CUSTOM_MAX,
+                            Math.max(
+                              CUSTOM_MIN,
+                              parsedCustomRobloxRate
+                            )
+                          )
                         : 0.43
                     }
-                    onChange={(event) => {
-                      setCustomRobloxRate(event.target.value);
-                      setProcessedFile(null);
-                      setError("");
-                      setProgress(0);
-                    }}
+                    onChange={(event) =>
+                      updateCustomRate(event.target.value)
+                    }
                     disabled={processing}
                     aria-label="Custom Roblox Playback Rate Slider"
                   />
@@ -346,36 +873,38 @@ function App() {
                   <input
                     className="custom-number"
                     type="number"
-                    min="0.01"
-                    max="20"
+                    min={CUSTOM_MIN}
+                    max={CUSTOM_MAX}
                     step="0.01"
                     value={customRobloxRate}
-                    onChange={(event) => {
-                      setCustomRobloxRate(event.target.value);
-                      setProcessedFile(null);
-                      setError("");
-                      setProgress(0);
-                    }}
+                    onChange={(event) =>
+                      updateCustomRate(event.target.value)
+                    }
                     onBlur={() => {
                       if (customRobloxRate === "") {
-                        setCustomRobloxRate("0.43");
+                        setCustomRobloxRate(DEFAULT_CUSTOM_RATE);
                         return;
                       }
 
                       const value = Number(customRobloxRate);
 
                       if (!Number.isFinite(value) || value <= 0) {
-                        setCustomRobloxRate("0.43");
+                        setCustomRobloxRate(DEFAULT_CUSTOM_RATE);
                         return;
                       }
 
                       setCustomRobloxRate(
-                        String(Math.min(20, Math.max(0.01, value)))
+                        String(
+                          Math.min(
+                            CUSTOM_MAX,
+                            Math.max(CUSTOM_MIN, value)
+                          )
+                        )
                       );
                     }}
                     disabled={processing}
                     aria-label="Custom Roblox Playback Rate Number"
-                    placeholder="0.43"
+                    placeholder={DEFAULT_CUSTOM_RATE}
                   />
                 </div>
               </div>
@@ -383,154 +912,218 @@ function App() {
 
             {/* INFO */}
             <div className="info-grid">
-
               <div className="info-card">
                 <span>SPEED</span>
 
                 <strong>
-                  {activeRobloxRate.toFixed(2)}
+                  {Number.isFinite(activeRobloxRate)
+                    ? activeRobloxRate.toFixed(2)
+                    : "—"}
                 </strong>
 
-                <small>
-                  ROBLOX TARGET
-                </small>
+                <small>ROBLOX TARGET</small>
               </div>
 
               <div className="info-card">
                 <span>PITCH</span>
 
-                <strong>
-                  LINKED
-                </strong>
+                <strong>LINKED</strong>
 
-                <small>
-                  WITH SPEED
-                </small>
+                <small>WITH SPEED</small>
               </div>
 
               <div className="info-card">
                 <span>GAIN</span>
 
-                <strong>
-                  -4
-                </strong>
+                <strong>-4</strong>
 
-                <small>
-                  DB
-                </small>
+                <small>DB</small>
               </div>
 
               <div className="info-card">
                 <span>OUTPUT</span>
 
-                <strong>
-                  OGG
-                </strong>
+                <strong>OGG</strong>
 
-                <small>
-                  MAX 20 MB
-                </small>
+                <small>MAX 20 MB</small>
               </div>
-
             </div>
 
             {/* ENGINE STATUS */}
             <div className="engine-status">
-
               <div className="status-icon" />
 
               <div>
-
-                <strong>
-                  Local Audio Engine
-                </strong>
+                <strong>Local Audio Engine</strong>
 
                 <p>
                   Audio is processed locally in your browser.
                   Your audio is not uploaded to a server.
                 </p>
-
               </div>
-
             </div>
 
-            {/* PROCESS BUTTON */}
-            <button
-              type="button"
-              className={`process-button ${
-                !selectedFile || processing
-                  ? "disabled"
-                  : ""
-              }`}
-              onClick={handleProcess}
-              disabled={!selectedFile || processing}
-            >
-
-              <span>
-                {processing ? "⚙" : "✦"}
-              </span>
-
-              {processing
-                ? `PROCESSING ${progress}%`
-                : "PROCESS AUDIO"}
-
-              <span>
-                {processing ? "…" : "→"}
-              </span>
-
-            </button>
-
-            {/* PROGRESS */}
+            {/* TOTAL PROGRESS */}
             {processing && (
-              <div className="processing-progress">
+              <div className="batch-progress-panel">
+                <div className="batch-progress-header">
+                  <div>
+                    <strong>
+                      FILE {Math.min(
+                        processingIndex + 1,
+                        selectedFiles.length
+                      )} / {selectedFiles.length}
+                    </strong>
 
-                <div className="progress-track">
+                    <span>
+                      {paused
+                        ? "PAUSED"
+                        : cancelRequested
+                          ? "CANCELING..."
+                          : "PROCESSING"}
+                    </span>
+                  </div>
 
+                  <strong>{totalProgress}%</strong>
+                </div>
+
+                <div className="progress-track total-progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{
+                      width: `${totalProgress}%`,
+                    }}
+                  />
+                </div>
+
+                <div className="progress-track current-progress-track">
                   <div
                     className="progress-fill"
                     style={{
                       width: `${progress}%`,
                     }}
                   />
-
                 </div>
 
-                <div className="progress-text">
-
+                <div className="progress-text batch-progress-text">
                   <span>
-                    Processing audio...
+                    CURRENT {progress}%
                   </span>
 
-                  <strong>
-                    {progress}%
-                  </strong>
-
+                  <span>
+                    {paused ? "RESUME TO CONTINUE" : "BATCH TOTAL"}
+                  </span>
                 </div>
 
+                <div className="batch-controls">
+                  {paused ? (
+                    <button
+                      type="button"
+                      className="batch-control-button"
+                      onClick={resumeBatch}
+                    >
+                      ▶ RESUME
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="batch-control-button"
+                      onClick={pauseBatch}
+                    >
+                      ❚❚ PAUSE
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    className="batch-control-button danger"
+                    onClick={cancelBatch}
+                  >
+                    ■ CANCEL
+                  </button>
+                </div>
               </div>
             )}
 
-            {/* SUCCESS */}
-            {processedFile && !processing && (
-              <div className="success-result">
+            {/* PROCESS BUTTON */}
+            <button
+              type="button"
+              className={`process-button ${
+                !selectedFiles.length || processing
+                  ? "disabled"
+                  : ""
+              }`}
+              onClick={handleProcess}
+              disabled={!selectedFiles.length || processing}
+            >
+              <span>{processing ? "⚙" : "✦"}</span>
 
-                <div className="success-dot" />
+              {processing
+                ? `PROCESSING ${
+                    processingIndex + 1
+                  }/${selectedFiles.length}`
+                : selectedFiles.length > 1
+                  ? "PROCESS ALL"
+                  : "PROCESS AUDIO"}
 
-                <div>
+              <span>{processing ? "…" : "→"}</span>
+            </button>
 
-                  <strong>
-                    Audio berhasil diproses
-                  </strong>
+            {/* RESULTS */}
+            {batchResults.length > 0 && !processing && (
+              <div className="batch-results">
+                <div className="batch-results-header">
+                  <div>
+                    <strong>PROCESSING RESULTS</strong>
 
-                  <p>
-                    OGG •{" "}
-                    {formatBytes(
-                      processedFile.size
-                    )}
-                  </p>
+                    <span>
+                      {doneCount}/{batchResults.length} DONE
+                    </span>
+                  </div>
 
+                  {hasDoneResults && (
+                    <button
+                      type="button"
+                      className="zip-button"
+                      onClick={downloadAllAsZip}
+                    >
+                      ↓ DOWNLOAD ALL ZIP
+                    </button>
+                  )}
                 </div>
 
+                <div className="batch-results-list">
+                  {batchResults.map((item) => (
+                    <div
+                      className={`batch-result-item ${item.status}`}
+                      key={item.id}
+                    >
+                      <span className="batch-result-status">
+                        {item.status === "done"
+                          ? "✓"
+                          : item.status === "error"
+                            ? "!"
+                            : item.status === "cancelled"
+                              ? "×"
+                              : "•"}
+                      </span>
+
+                      <div className="batch-result-name">
+                        <strong title={item.fileName}>
+                          {item.fileName}
+                        </strong>
+
+                        <small>
+                          {item.status === "done"
+                            ? `OGG • ${formatBytes(item.size)}`
+                            : item.status === "error"
+                              ? item.error
+                              : item.status.toUpperCase()}
+                        </small>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -540,42 +1133,20 @@ function App() {
                 {error}
               </div>
             )}
-
           </div>
-
         </section>
 
-        {/* FOOTER */}
         <footer>
-
           <span>GONAUDIO</span>
-
           <span>•</span>
-
-          <span>
-            AUDIO PROCESSOR V1.0
-          </span>
-
+          <span>AUDIO PROCESSOR V2.0</span>
           <span>•</span>
-
-          <span>
-            FREE 0/∞
-          </span>
-
+          <span>FREE 0/∞</span>
           <span>•</span>
-
-          <span>
-            PRIVACY
-          </span>
-
+          <span>PRIVACY</span>
           <span>•</span>
-
-          <span>
-            TERMS
-          </span>
-
+          <span>TERMS</span>
         </footer>
-
       </main>
     </div>
   );

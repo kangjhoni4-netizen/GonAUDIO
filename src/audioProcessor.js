@@ -3,6 +3,14 @@ import encodeOgg from "@audio/encode-ogg";
 const MAX_OUTPUT_BYTES = 20 * 1024 * 1024;
 const GAIN_DB = -4;
 
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    const error = new Error("Audio processing dibatalkan.");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
 function dbToGain(db) {
   return Math.pow(10, db / 20);
 }
@@ -99,8 +107,12 @@ async function encodeToOgg(audioBuffer, quality) {
 export async function processAudio(
   file,
   processingSpeed,
-  onProgress
+  onProgress,
+  options = {}
 ) {
+  const signal = options?.signal;
+  throwIfAborted(signal);
+
   if (!file) {
     throw new Error("Audio file belum dipilih.");
   }
@@ -115,6 +127,7 @@ export async function processAudio(
   onProgress?.(5);
 
   const arrayBuffer = await file.arrayBuffer();
+  throwIfAborted(signal);
 
   onProgress?.(15);
 
@@ -128,6 +141,7 @@ export async function processAudio(
         arrayBuffer.slice(0)
       );
 
+    throwIfAborted(signal);
     onProgress?.(30);
 
     const renderedBuffer =
@@ -136,6 +150,7 @@ export async function processAudio(
         processingSpeed
       );
 
+    throwIfAborted(signal);
     onProgress?.(65);
 
     /*
@@ -154,6 +169,8 @@ export async function processAudio(
     ) {
       const quality = qualities[index];
 
+      throwIfAborted(signal);
+
       const blob = await encodeToOgg(
         renderedBuffer,
         quality
@@ -168,6 +185,8 @@ export async function processAudio(
         );
 
       onProgress?.(encodeProgress);
+
+      throwIfAborted(signal);
 
       if (blob.size <= MAX_OUTPUT_BYTES) {
         finalBlob = blob;
