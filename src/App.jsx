@@ -1,3 +1,6 @@
+// GonAUDIO App.jsx — V19 POPUP FIX
+// File ini berisi source code lengkap. Salin ke App.jsx setelah membuat backup.
+
 import { useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
 import FingerprintJS from "@fingerprintjs/fingerprintjs";
@@ -28,6 +31,8 @@ const MAX_FILES = 50;
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || "0x4AAAAAAFK2H6hFanUq099w";
 const TURNSTILE_ACTION = "process_audio";
 const DEVICE_QUOTA_FUNCTION = "device-quota";
+const MIDTRANS_PAYMENT_FUNCTION = "midtrans-payment";
+const PAYMENT_SESSION_KEY = "gonaudio_active_payment";
 const DEFAULT_FREE_DAILY_LIMIT = 10;
 
 function createId(file, index) {
@@ -43,6 +48,30 @@ function getBaseName(fileName) {
       .replace(/[^\w\- ]/g, "")
       .trim() || "audio"
   );
+}
+
+function formatAccessExpiry(value) {
+  if (!value) return "-";
+
+  try {
+    return new Intl.DateTimeFormat("id-ID", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: "Asia/Jakarta",
+    }).format(new Date(value));
+  } catch {
+    return value;
+  }
+}
+
+function getAccessPlanLabel(planKey) {
+  const labels = {
+    "3D": "3 DAYS",
+    "7D": "7 DAYS",
+    "30D": "30 DAYS",
+  };
+
+  return labels[planKey] || planKey || "UNLIMITED";
 }
 
 let turnstileScriptPromise = null;
@@ -262,6 +291,21 @@ function PublicApp() {
   const [quotaUsed, setQuotaUsed] = useState(0);
   const [quotaRemaining, setQuotaRemaining] = useState(0);
   const [quotaLimit, setQuotaLimit] = useState(DEFAULT_FREE_DAILY_LIMIT);
+  const [hasUnlimitedAccess, setHasUnlimitedAccess] = useState(false);
+  const [accessPlan, setAccessPlan] = useState("");
+  const [accessExpiresAt, setAccessExpiresAt] = useState("");
+  const [accessCodeInput, setAccessCodeInput] = useState("");
+  const [accessLoading, setAccessLoading] = useState(false);
+  const [accessMessage, setAccessMessage] = useState("");
+  const [accessError, setAccessError] = useState("");
+
+  const [paymentModalOpen, setPaymentModalOpen] = useState(false);
+  const [paymentLoading, setPaymentLoading] = useState(false);
+  const [paymentError, setPaymentError] = useState("");
+  const [paymentData, setPaymentData] = useState(null);
+  const [paymentCountdown, setPaymentCountdown] = useState(0);
+  const [paymentChecking, setPaymentChecking] = useState(false);
+
   const [turnstileReady, setTurnstileReady] = useState(false);
   const [turnstileError, setTurnstileError] = useState("");
   const [error, setError] = useState("");
@@ -375,7 +419,8 @@ function PublicApp() {
   const callDeviceQuota = async (
     action,
     fingerprint = deviceFingerprint,
-    turnstileToken = ""
+    turnstileToken = "",
+    accessCode = ""
   ) => {
     if (!fingerprint) {
       throw new Error(
@@ -391,12 +436,46 @@ function PublicApp() {
             action,
             visitorId: fingerprint,
             turnstileToken,
+            accessCode,
           },
         }
       );
 
     if (functionError) {
-      throw functionError;
+      let serverMessage = "";
+
+      if (data && typeof data === "object" && data.message) {
+        serverMessage = String(data.message);
+      }
+
+      if (!serverMessage && functionError?.context) {
+        try {
+          const context = functionError.context;
+
+          if (
+            typeof context?.clone === "function" &&
+            typeof context?.json === "function"
+          ) {
+            const responseBody = await context.clone().json();
+
+            if (
+              responseBody &&
+              typeof responseBody === "object" &&
+              responseBody.message
+            ) {
+              serverMessage = String(responseBody.message);
+            }
+          }
+        } catch {
+          // Ignore response parsing errors and use the fallback below.
+        }
+      }
+
+      throw new Error(
+        serverMessage ||
+          functionError?.message ||
+          "Edge Function request gagal."
+      );
     }
 
     if (!data) {
@@ -406,6 +485,338 @@ function PublicApp() {
     }
 
     return data;
+  };
+
+  const callPayment = async (action, extra = {}) => {
+    const result = await supabase.functions.invoke(
+      MIDTRANS_PAYMENT_FUNCTION,
+      {
+        body: {
+          action,
+          ...extra,
+        },
+      }
+    );
+
+    const { data, error: functionError } = result;
+
+    if (functionError) {
+      let serverMessage = "";
+
+      if (data && typeof data === "object" && data.message) {
+        serverMessage = String(data.message);
+      }
+
+      if (!serverMessage && functionError?.context) {
+        try {
+          const context = functionError.context;
+
+          if (
+            typeof context?.clone === "function" &&
+            typeof context?.json === "function"
+          ) {
+            const responseBody = await context.clone().json();
+
+            if (
+              responseBody &&
+              typeof responseBody === "object" &&
+              responseBody.message
+            ) {
+              serverMessage = String(responseBody.message);
+            }
+          }
+        } catch {
+          // Ignore response parsing errors.
+        }
+      }
+
+      throw new Error(
+        serverMessage ||
+          functionError?.message ||
+          "Payment gateway request gagal."
+      );
+    }
+
+    if (!data) {
+      throw new Error("Payment gateway tidak mengembalikan data.");
+    }
+
+    if (!data.success) {
+      throw new Error(
+        data.message || "Gagal membuat transaksi pembayaran."
+      );
+    }
+
+    return data;
+  };
+
+  const persistPayment = (value) => {
+    setPaymentData(value);
+
+    try {
+      sessionStorage.setItem(
+        PAYMENT_SESSION_KEY,
+        JSON.stringify(value)
+      );
+    } catch {
+      // Ignore storage errors.
+    }
+  };
+
+  const clearPersistedPayment = () => {
+    try {
+      sessionStorage.removeItem(PAYMENT_SESSION_KEY);
+    } catch {
+      // Ignore storage errors.
+    }
+  };
+
+  const createQrisPayment = async (planKey) => {
+    if (!deviceReady || !deviceFingerprint) {
+      setPaymentError(
+        "Device identification belum siap. Coba refresh halaman."
+      );
+      return;
+    }
+
+    if (paymentLoading) return;
+
+    setPaymentLoading(true);
+    setPaymentError("");
+    setAccessError("");
+
+    try {
+      const turnstileToken = await getTurnstileToken();
+
+      const data = await callPayment("create_qris", {
+        planKey,
+        visitorId: deviceFingerprint,
+        turnstileToken,
+      });
+
+      const nextPayment = {
+        orderId: data.order_id,
+        lookupToken: data.lookup_token,
+        planKey: data.plan_key,
+        amount: Number(data.amount) || 0,
+        qrUrl: data.qr_url || "",
+        qrString: data.qr_string || "",
+        status: data.status || "pending",
+        expiresAt: data.expires_at || "",
+        accessCode: data.access_code || "",
+        createdAt: data.created_at || new Date().toISOString(),
+      };
+
+      persistPayment(nextPayment);
+      setPaymentModalOpen(true);
+      setPaymentCountdown(
+        Math.max(
+          0,
+          Math.ceil(
+            (new Date(nextPayment.expiresAt).getTime() -
+              Date.now()) /
+              1000
+          )
+        )
+      );
+    } catch (paymentCreateError) {
+      console.error(paymentCreateError);
+      setPaymentError(
+        paymentCreateError?.message ||
+          "Gagal membuat QRIS. Silakan coba lagi."
+      );
+    } finally {
+      setPaymentLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    try {
+      const stored = sessionStorage.getItem(PAYMENT_SESSION_KEY);
+
+      if (stored) {
+        const parsed = JSON.parse(stored);
+
+        if (
+          parsed?.orderId &&
+          parsed?.lookupToken &&
+          parsed?.planKey
+        ) {
+          const restoredStatus = String(
+            parsed.status || ""
+          ).toLowerCase();
+
+          if (restoredStatus === "settlement" && parsed.accessCode) {
+            // A completed payment must not force the modal open again.
+            clearPersistedPayment();
+            setPaymentData(parsed);
+            setPaymentModalOpen(false);
+          } else {
+            setPaymentData(parsed);
+            setPaymentModalOpen(true);
+          }
+        }
+      }
+    } catch {
+      clearPersistedPayment();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!paymentData?.expiresAt) {
+      setPaymentCountdown(0);
+      return;
+    }
+
+    const tick = () => {
+      const remaining = Math.max(
+        0,
+        Math.ceil(
+          (new Date(paymentData.expiresAt).getTime() -
+            Date.now()) /
+            1000
+        )
+      );
+
+      setPaymentCountdown(remaining);
+    };
+
+    tick();
+
+    const intervalId = window.setInterval(tick, 1000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [paymentData?.expiresAt]);
+
+  useEffect(() => {
+    if (
+      !paymentData?.orderId ||
+      !paymentData?.lookupToken ||
+      !deviceFingerprint
+    ) {
+      return;
+    }
+
+    let stopped = false;
+
+    const checkPaymentStatus = async () => {
+      if (stopped) return;
+
+      setPaymentChecking(true);
+
+      try {
+        const data = await callPayment("status", {
+          orderId: paymentData.orderId,
+          lookupToken: paymentData.lookupToken,
+          visitorId: deviceFingerprint,
+        });
+
+        if (stopped) return;
+
+        const next = {
+          ...paymentData,
+          status: data.status || paymentData.status,
+          qrUrl: data.qr_url || paymentData.qrUrl,
+          expiresAt: data.expires_at || paymentData.expiresAt,
+          accessCode:
+            data.access_code || paymentData.accessCode || "",
+        };
+
+        const normalizedStatus = String(
+          data.status || next.status || ""
+        ).toLowerCase();
+
+        if (normalizedStatus === "settlement") {
+          // Never persist a completed payment. This prevents session restore
+          // from reopening the modal after the user closes it.
+          setPaymentData(next);
+          clearPersistedPayment();
+
+          if (next.accessCode) {
+            setAccessCodeInput("");
+            setPaymentError("");
+          }
+        } else {
+          persistPayment(next);
+        }
+
+        if (
+          ["expire", "deny", "cancel"].includes(normalizedStatus)
+        ) {
+          setPaymentModalOpen(true);
+        }
+      } catch (statusError) {
+        if (!stopped) {
+          console.error("PAYMENT STATUS ERROR:", statusError);
+          setPaymentError(
+            statusError?.message ||
+              "Gagal mengecek status pembayaran."
+          );
+        }
+      } finally {
+        if (!stopped) {
+          setPaymentChecking(false);
+        }
+      }
+    };
+
+    checkPaymentStatus();
+
+    const intervalId = window.setInterval(
+      checkPaymentStatus,
+      10000
+    );
+
+    return () => {
+      stopped = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    paymentData?.orderId,
+    paymentData?.lookupToken,
+    deviceFingerprint,
+  ]);
+
+  const closePaymentModal = () => {
+    setPaymentModalOpen(false);
+
+    // If payment has completed, forget the saved modal session so it cannot
+    // reopen after refresh. Keep paymentData in memory for the current page.
+    if (
+      String(paymentData?.status || "").toLowerCase() === "settlement" &&
+      paymentData?.accessCode
+    ) {
+      clearPersistedPayment();
+    }
+  };
+
+  const copyPaidAccessCode = async () => {
+    const code = paymentData?.accessCode;
+
+    if (!code) return;
+
+    try {
+      await navigator.clipboard.writeText(code);
+      setAccessMessage(
+        `Access Code ${code} berhasil disalin.`
+      );
+      setAccessError("");
+    } catch (copyError) {
+      console.error(copyError);
+      setAccessError(
+        "Browser tidak mengizinkan copy otomatis. Salin code secara manual."
+      );
+    }
+  };
+
+  const startNewPayment = () => {
+    clearPersistedPayment();
+    setPaymentData(null);
+    setPaymentModalOpen(false);
+    setPaymentError("");
+    setPaymentCountdown(0);
   };
 
   const loadQuota = async (
@@ -446,15 +857,23 @@ function PublicApp() {
           ? limitValue
           : DEFAULT_FREE_DAILY_LIMIT;
 
+      const unlimited = Boolean(data.unlimited);
+
       setQuotaUsed(used);
       setQuotaRemaining(remaining);
       setQuotaLimit(limit);
+      setHasUnlimitedAccess(unlimited);
+      setAccessPlan(data.access_plan || "");
+      setAccessExpiresAt(data.access_expires_at || "");
       setDeviceError("");
 
       return {
         used,
         remaining,
         limit,
+        unlimited,
+        accessPlan: data.access_plan || "",
+        accessExpiresAt: data.access_expires_at || "",
       };
     } catch (quotaError) {
       console.error(quotaError);
@@ -588,34 +1007,6 @@ function PublicApp() {
       turnstileToken
     );
 
-    if (!data.success) {
-      const used = Math.max(
-        0,
-        Number(data.used) || 0
-      );
-      const remaining = Math.max(
-        0,
-        Number(data.remaining) || 0
-      );
-
-      const limitValue = Number(data.limit);
-      const limit =
-        Number.isFinite(limitValue) && limitValue >= 0
-          ? limitValue
-          : DEFAULT_FREE_DAILY_LIMIT;
-
-      setQuotaUsed(used);
-      setQuotaRemaining(remaining);
-      setQuotaLimit(limit);
-
-      return {
-        success: false,
-        used,
-        remaining,
-        limit,
-      };
-    }
-
     const used = Math.max(
       0,
       Number(data.used) || 0
@@ -631,16 +1022,95 @@ function PublicApp() {
         ? limitValue
         : DEFAULT_FREE_DAILY_LIMIT;
 
+    const unlimited = Boolean(data.unlimited);
+
     setQuotaUsed(used);
     setQuotaRemaining(remaining);
     setQuotaLimit(limit);
+    setHasUnlimitedAccess(unlimited);
+    setAccessPlan(data.access_plan || "");
+    setAccessExpiresAt(data.access_expires_at || "");
 
     return {
-      success: true,
+      success: Boolean(data.success),
       used,
       remaining,
       limit,
+      unlimited,
+      accessPlan: data.access_plan || "",
+      accessExpiresAt: data.access_expires_at || "",
     };
+  };
+
+  const activateAccessCode = async (event) => {
+    event.preventDefault();
+
+    const code = accessCodeInput.trim().toUpperCase();
+
+    if (!code) {
+      setAccessError("Masukkan access code terlebih dahulu.");
+      setAccessMessage("");
+      return;
+    }
+
+    if (!deviceReady || !deviceFingerprint) {
+      setAccessError(
+        "Device identification belum siap. Coba refresh halaman."
+      );
+      setAccessMessage("");
+      return;
+    }
+
+    if (accessLoading) {
+      return;
+    }
+
+    setAccessLoading(true);
+    setAccessError("");
+    setAccessMessage("");
+
+    try {
+      const turnstileToken = await getTurnstileToken();
+
+      const data = await callDeviceQuota(
+        "activate",
+        deviceFingerprint,
+        turnstileToken,
+        code
+      );
+
+      if (!data.success) {
+        throw new Error(
+          data.message || "Access code tidak dapat diaktifkan."
+        );
+      }
+
+      setAccessCodeInput("");
+      setHasUnlimitedAccess(Boolean(data.unlimited));
+      setAccessPlan(data.access_plan || "");
+      setAccessExpiresAt(data.access_expires_at || "");
+
+      setAccessMessage(
+        `Access ${getAccessPlanLabel(
+          data.access_plan
+        )} berhasil diaktifkan. Unlimited processing aktif sampai ${formatAccessExpiry(
+          data.access_expires_at
+        )}.`
+      );
+
+      await loadQuota(deviceFingerprint);
+    } catch (activationError) {
+      console.error(activationError);
+
+      setAccessError(
+        activationError?.message ||
+          "Gagal mengaktifkan access code."
+      );
+
+      setAccessMessage("");
+    } finally {
+      setAccessLoading(false);
+    }
   };
 
   const isValidAudio = (file) => {
@@ -1078,10 +1548,14 @@ function PublicApp() {
     }
 
     const liveQuota = await loadQuota();
+    const unlimitedActive = Boolean(liveQuota?.unlimited);
 
-    if (!liveQuota || liveQuota.remaining <= 0) {
+    if (
+      !liveQuota ||
+      (!unlimitedActive && liveQuota.remaining <= 0)
+    ) {
       setError(
-        "Kuota gratis hari ini sudah habis. Reset setiap 00:00 WIB."
+        "Kuota gratis hari ini sudah habis. Aktivasi access code untuk unlimited processing."
       );
       return;
     }
@@ -1380,22 +1854,25 @@ function PublicApp() {
     }
 
     const liveQuota = await loadQuota();
+    const unlimitedActive = Boolean(liveQuota?.unlimited);
 
-    if (!liveQuota || liveQuota.remaining <= 0) {
+    if (
+      !liveQuota ||
+      (!unlimitedActive && liveQuota.remaining <= 0)
+    ) {
       setError(
-        "Kuota gratis hari ini sudah habis. Reset setiap 00:00 WIB."
+        "Kuota gratis hari ini sudah habis. Aktivasi access code untuk unlimited processing."
       );
       return;
     }
 
-    const processableItems = selectedFiles.slice(
-      0,
-      liveQuota.remaining
-    );
+    const processableItems = unlimitedActive
+      ? selectedFiles
+      : selectedFiles.slice(0, liveQuota.remaining);
 
     if (
-      processableItems.length <
-      selectedFiles.length
+      !unlimitedActive &&
+      processableItems.length < selectedFiles.length
     ) {
       setError(
         `Sisa quota ${liveQuota.remaining}x. Hanya ${processableItems.length} audio yang diproses pada batch ini.`
@@ -1650,10 +2127,12 @@ function PublicApp() {
     (item) => item.status === "done"
   ).length;
 
-  const processableCount = Math.min(
-    selectedFiles.length,
-    quotaRemaining
-  );
+  const processableCount = hasUnlimitedAccess
+    ? selectedFiles.length
+    : Math.min(
+        selectedFiles.length,
+        quotaRemaining
+      );
 
   const hasDoneResults = doneCount > 0;
 
@@ -1667,7 +2146,7 @@ function PublicApp() {
         <section className="hero">
           <div className="version-badge">
             <span className="badge-dot" />
-            AUDIO PROCESSING V10.0
+            AUDIO PROCESSING V14.0
           </div>
 
           <h1>
@@ -1692,32 +2171,323 @@ function PublicApp() {
               </div>
 
               <div className="device-quota-copy">
-                <strong>DEVICE IDENTIFICATION ACTIVE</strong>
+                <strong>
+                  {hasUnlimitedAccess
+                    ? "UNLIMITED ACCESS ACTIVE"
+                    : "DEVICE IDENTIFICATION ACTIVE"}
+                </strong>
 
                 <span>
                   {deviceLoading
                     ? "Identifying this browser..."
                     : deviceError
                       ? deviceError
-                      : "This browser has its own server-side free processing quota."}
+                      : hasUnlimitedAccess
+                        ? `${getAccessPlanLabel(
+                            accessPlan
+                          )} access aktif pada device ini.`
+                        : "This browser has its own server-side free processing quota."}
                 </span>
               </div>
             </div>
 
             <div className="device-quota-value">
-              <small>FREE TODAY</small>
+              <small>{hasUnlimitedAccess ? "ACCESS" : "FREE TODAY"}</small>
 
               <strong>
-                {quotaLoading ? "..." : `${quotaRemaining}/${quotaLimit}`}
+                {quotaLoading
+                  ? "..."
+                  : hasUnlimitedAccess
+                    ? "∞"
+                    : `${quotaRemaining}/${quotaLimit}`}
               </strong>
             </div>
 
             <div className="device-quota-reset">
-              RESET
-              <strong>00:00 WIB</strong>
+              {hasUnlimitedAccess ? "EXPIRES" : "RESET"}
+              <strong>
+                {hasUnlimitedAccess
+                  ? formatAccessExpiry(accessExpiresAt)
+                  : "00:00 WIB"}
+              </strong>
             </div>
           </div>
         </section>
+
+        {/* ACCESS CODE */}
+        <section className="access-code-section">
+          <div
+            className={`access-code-card ${
+              hasUnlimitedAccess ? "active" : ""
+            }`}
+          >
+            <div className="access-code-heading">
+              <div>
+                <strong>
+                  {hasUnlimitedAccess
+                    ? "UNLIMITED ACCESS ACTIVE"
+                    : "UNLOCK UNLIMITED PROCESSING"}
+                </strong>
+                <span>
+                  {hasUnlimitedAccess
+                    ? `${getAccessPlanLabel(
+                        accessPlan
+                      )} • expires ${formatAccessExpiry(
+                        accessExpiresAt
+                      )}`
+                    : "Masukkan access code yang kamu beli untuk mengaktifkan unlimited processing di device ini."}
+                </span>
+              </div>
+
+              <div className="access-code-prices">
+                <button
+                  type="button"
+                  onClick={() => createQrisPayment("3D")}
+                  disabled={paymentLoading || hasUnlimitedAccess}
+                >
+                  <strong>3 HARI</strong>
+                  <span>Rp30.000</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => createQrisPayment("7D")}
+                  disabled={paymentLoading || hasUnlimitedAccess}
+                >
+                  <strong>7 HARI</strong>
+                  <span>Rp50.000</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => createQrisPayment("30D")}
+                  disabled={paymentLoading || hasUnlimitedAccess}
+                >
+                  <strong>30 HARI</strong>
+                  <span>Rp80.000</span>
+                </button>
+              </div>
+            </div>
+
+            {!hasUnlimitedAccess ? (
+              <form
+                className="access-code-form"
+                onSubmit={activateAccessCode}
+              >
+                <input
+                  type="text"
+                  value={accessCodeInput}
+                  onChange={(event) =>
+                    setAccessCodeInput(
+                      event.target.value.toUpperCase()
+                    )
+                  }
+                  placeholder="GON-7D-XXXXXXXX-XXXXXXXX-XXXXXXXX"
+                  autoComplete="off"
+                  spellCheck="false"
+                  disabled={accessLoading || !deviceReady}
+                />
+
+                <button
+                  type="submit"
+                  disabled={
+                    accessLoading ||
+                    !deviceReady ||
+                    !accessCodeInput.trim()
+                  }
+                >
+                  {accessLoading
+                    ? "ACTIVATING..."
+                    : "ACTIVATE CODE"}
+                </button>
+              </form>
+            ) : (
+              <div className="access-code-active-row">
+                <span>
+                  ✓ Unlimited processing aktif untuk browser/device ini.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => loadQuota()}
+                  disabled={quotaLoading}
+                >
+                  {quotaLoading
+                    ? "REFRESHING..."
+                    : "REFRESH ACCESS"}
+                </button>
+              </div>
+            )}
+
+            {accessError ? (
+              <div className="access-code-feedback error">
+                {accessError}
+              </div>
+            ) : null}
+
+            {accessMessage ? (
+              <div className="access-code-feedback success">
+                {accessMessage}
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        {paymentModalOpen && paymentData ? (
+          <div
+            className="payment-modal-backdrop"
+            role="presentation"
+          >
+            <div
+              className="payment-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Pembayaran QRIS"
+            >
+              <div className="payment-modal-header">
+                <div>
+                  <strong>QRIS PAYMENT</strong>
+                  <span>
+                    {getAccessPlanLabel(paymentData.planKey)} •{" "}
+                    Rp
+                    {Number(
+                      paymentData.amount || 0
+                    ).toLocaleString("id-ID")}
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  className="payment-modal-close"
+                  onClick={closePaymentModal}
+                >
+                  ×
+                </button>
+              </div>
+
+              <div className="payment-modal-body">
+                {String(
+                  paymentData.status || ""
+                ).toLowerCase() === "settlement" &&
+                paymentData.accessCode ? (
+                  <div className="payment-success-state">
+                    <div className="payment-success-icon">
+                      ✓
+                    </div>
+
+                    <strong>PEMBAYARAN BERHASIL</strong>
+
+                    <span>
+                      Access Code sudah otomatis dibuat.
+                      Simpan code ini dan gunakan sesuai
+                      kebutuhan.
+                    </span>
+
+                    <code>
+                      {paymentData.accessCode}
+                    </code>
+
+                    <div className="payment-success-actions">
+                      <button
+                        type="button"
+                        onClick={copyPaidAccessCode}
+                      >
+                        COPY CODE
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAccessCodeInput(
+                            paymentData.accessCode
+                          );
+                          setPaymentModalOpen(false);
+                        }}
+                      >
+                        USE CODE
+                      </button>
+                    </div>
+                  </div>
+                ) : ["expire", "deny", "cancel"].includes(
+                    String(
+                      paymentData.status || ""
+                    ).toLowerCase()
+                  ) ? (
+                  <div className="payment-expired-state">
+                    <strong>PEMBAYARAN TIDAK SELESAI</strong>
+                    <span>
+                      QRIS ini sudah tidak dapat digunakan.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={startNewPayment}
+                    >
+                      BUAT PEMBAYARAN BARU
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    {paymentData.qrUrl ? (
+                      <div className="payment-qr-shell">
+                        <img
+                          src={paymentData.qrUrl}
+                          alt="QRIS pembayaran GonAUDIO"
+                        />
+                      </div>
+                    ) : (
+                      <div className="payment-qr-error">
+                        QRIS image belum tersedia. Tutup lalu
+                        buat transaksi baru.
+                      </div>
+                    )}
+
+                    <div className="payment-order-row">
+                      <span>ORDER ID</span>
+                      <code>{paymentData.orderId}</code>
+                    </div>
+
+                    <div className="payment-countdown">
+                      <small>
+                        SELESAIKAN PEMBAYARAN DALAM
+                      </small>
+                      <strong>
+                        {Math.floor(
+                          paymentCountdown / 60
+                        )
+                          .toString()
+                          .padStart(2, "0")}
+                        :
+                        {(paymentCountdown % 60)
+                          .toString()
+                          .padStart(2, "0")}
+                      </strong>
+                    </div>
+
+                    <div className="payment-pending-row">
+                      <span className="payment-pulse" />
+                      <span>
+                        {paymentChecking
+                          ? "Memeriksa status pembayaran..."
+                          : "Menunggu pembayaran QRIS..."}
+                      </span>
+                    </div>
+
+                    <p className="payment-note">
+                      Setelah pembayaran berhasil dikonfirmasi
+                      Midtrans, Access Code akan otomatis dibuat
+                      dan tampil di sini.
+                    </p>
+                  </>
+                )}
+
+                {paymentError ? (
+                  <div className="payment-modal-error">
+                    {paymentError}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {/* MAIN WORKSPACE */}
         <section className="workspace">
@@ -2265,7 +3035,7 @@ function PublicApp() {
                 !deviceReady ||
                 
                 quotaLoading ||
-                quotaRemaining <= 0
+                (!hasUnlimitedAccess && quotaRemaining <= 0)
                   ? "disabled"
                   : ""
               }`}
@@ -2276,7 +3046,7 @@ function PublicApp() {
                 !deviceReady ||
                 
                 quotaLoading ||
-                quotaRemaining <= 0
+                (!hasUnlimitedAccess && quotaRemaining <= 0)
               }
             >
               <span>{processing ? "⚙" : "✦"}</span>
@@ -2289,14 +3059,16 @@ function PublicApp() {
                   ? "CHECKING DEVICE QUOTA"
                   : !deviceReady || !deviceFingerprint
                     ? "DEVICE IDENTIFICATION UNAVAILABLE"
-                    : quotaRemaining <= 0
-                      ? "DAILY LIMIT REACHED"
-                      : `PROCESS QUEUE • ${
-                          Math.min(
-                            selectedFiles.length,
-                            quotaRemaining
-                          )
-                        }`}
+                    : hasUnlimitedAccess
+                      ? `UNLIMITED ACCESS • PROCESS QUEUE • ${selectedFiles.length}`
+                      : quotaRemaining <= 0
+                        ? "DAILY LIMIT REACHED"
+                        : `PROCESS QUEUE • ${
+                            Math.min(
+                              selectedFiles.length,
+                              quotaRemaining
+                            )
+                          }`}
 
               <span>{processing ? "…" : "→"}</span>
             </button>
@@ -2366,7 +3138,7 @@ function PublicApp() {
                             !deviceReady ||
                             
                             quotaLoading ||
-                            quotaRemaining <= 0
+                            (!hasUnlimitedAccess && quotaRemaining <= 0)
                           }
                         >
                           RETRY
@@ -2494,10 +3266,12 @@ function PublicApp() {
         <footer>
           <span>GONAUDIO</span>
           <span>•</span>
-          <span>AUDIO PROCESSOR V10.0</span>
+          <span>AUDIO PROCESSOR V14.0</span>
           <span>•</span>
           <span>
-            DEVICE FREE {quotaRemaining}/{quotaLimit}
+            {hasUnlimitedAccess
+              ? `UNLIMITED ${getAccessPlanLabel(accessPlan)}`
+              : `DEVICE FREE ${quotaRemaining}/${quotaLimit}`}
           </span>
           <span>•</span>
           <span>PRIVACY</span>
