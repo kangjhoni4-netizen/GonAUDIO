@@ -1861,3 +1861,485 @@ footer span:first-child {
     flex-direction: column;
   }
 }
+
+
+/* =========================================================
+   DOWNLOAD MANAGER V6
+   ========================================================= */
+
+.download-manager {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0e1015;
+}
+
+.download-manager-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.download-manager-header > div {
+  min-width: 0;
+}
+
+.download-manager-header strong {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.09em;
+}
+
+.download-manager-header span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted-dark);
+  font-size: 8px;
+  font-weight: 900;
+}
+
+.clear-results-button,
+.select-results-button,
+.download-selected-button,
+.download-all-button,
+.download-one-button {
+  padding: 7px 9px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #11141a;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+}
+
+.clear-results-button {
+  border-color: rgba(239, 68, 68, 0.22);
+  color: #ff9b9b;
+}
+
+.clear-results-button:hover:not(:disabled) {
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.clear-results-button:disabled,
+.select-results-button:disabled,
+.download-selected-button:disabled,
+.download-all-button:disabled,
+.download-one-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.download-manager-toolbar {
+  margin-top: 9px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.download-selected-button {
+  border-color: rgba(255, 122, 0, 0.25);
+  color: var(--orange-light);
+}
+
+.download-selected-button:hover:not(:disabled),
+.download-all-button:hover:not(:disabled),
+.select-results-button:hover:not(:disabled) {
+  border-color: rgba(255, 122, 0, 0.48);
+  color: var(--orange-light);
+}
+
+.download-all-button {
+  margin-left: auto;
+  border-color: rgba(34, 197, 94, 0.2);
+  color: rgba(34, 197, 94, 0.82);
+}
+
+.download-all-button:hover:not(:disabled) {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.05);
+  color: var(--success);
+}
+
+.download-manager-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.download-item {
+  min-width: 0;
+  padding: 8px 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.045);
+  border-radius: 8px;
+  background: #0b0d11;
+}
+
+.download-item.selected {
+  border-color: rgba(255, 122, 0, 0.32);
+  background: rgba(255, 122, 0, 0.055);
+}
+
+.download-check {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.download-check input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.download-check span {
+  width: 15px;
+  height: 15px;
+  display: block;
+  border: 1px solid #3a3f49;
+  border-radius: 4px;
+  background: #090b0f;
+}
+
+.download-check input:checked + span {
+  border-color: var(--orange);
+  background: var(--orange);
+  box-shadow: inset 0 0 0 3px #090b0f;
+}
+
+.download-item-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.download-item-info strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+}
+
+.download-item-info small {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-dark);
+  font-size: 7px;
+}
+
+.download-one-button {
+  flex: 0 0 auto;
+  border-color: rgba(34, 197, 94, 0.2);
+  color: rgba(34, 197, 94, 0.82);
+}
+
+.download-one-button:hover:not(:disabled) {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.05);
+  color: var(--success);
+}
+
+@media (max-width: 680px) {
+  .download-manager-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .download-manager-header .clear-results-button {
+    width: 100%;
+  }
+
+  .download-manager-toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .download-all-button {
+    margin-left: 0;
+  }
+
+  .download-manager-toolbar button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 520px) {
+  .download-one-button {
+    padding: 6px 7px;
+    font-size: 7px;
+  }
+
+  .download-item {
+    gap: 6px;
+  }
+}
+
+
+/* =========================================================
+   DEVICE QUOTA V9
+   ========================================================= */
+
+.device-quota-section {
+  width: min(920px, 100%);
+  margin: -18px auto 22px;
+  position: relative;
+  z-index: 2;
+}
+
+.device-quota-card {
+  min-width: 0;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 18px;
+  border: 1px solid rgba(34, 197, 94, 0.18);
+  border-radius: 12px;
+  background: rgba(13, 15, 20, 0.88);
+  box-shadow:
+    0 18px 45px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  backdrop-filter: blur(18px);
+}
+
+.device-quota-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.device-quota-indicator {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 12px rgba(34, 197, 94, 0.65);
+}
+
+.device-quota-indicator span {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  animation: deviceQuotaPulse 1.8s ease-in-out infinite;
+}
+
+.device-quota-copy {
+  min-width: 0;
+}
+
+.device-quota-copy strong {
+  display: block;
+  font-size: 9px;
+  font-weight: 950;
+  letter-spacing: 0.095em;
+}
+
+.device-quota-copy span {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-dark);
+  font-size: 8px;
+}
+
+.device-quota-value {
+  min-width: 74px;
+  text-align: center;
+}
+
+.device-quota-value small,
+.device-quota-reset {
+  display: block;
+  color: var(--muted-dark);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+}
+
+.device-quota-value strong {
+  display: block;
+  margin-top: 3px;
+  color: rgba(34, 197, 94, 0.92);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.device-quota-reset {
+  min-width: 76px;
+  text-align: right;
+  line-height: 1.45;
+}
+
+.device-quota-reset strong {
+  display: block;
+  color: var(--orange-light);
+  font-size: 8px;
+  letter-spacing: 0.04em;
+}
+
+@keyframes deviceQuotaPulse {
+  0%,
+  100% {
+    transform: scale(0.65);
+    opacity: 0.4;
+  }
+
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 680px) {
+  .device-quota-section {
+    margin-top: -9px;
+  }
+
+  .device-quota-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+  }
+
+  .device-quota-reset {
+    grid-column: 1 / -1;
+    min-width: 0;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    text-align: left;
+  }
+}
+
+
+/* =========================================================
+   DEVICE FINGERPRINT QUOTA V10
+   ========================================================= */
+
+.device-quota-card {
+  border-color: rgba(255, 122, 0, 0.18);
+}
+
+.device-quota-indicator span {
+  background: var(--success);
+  box-shadow: 0 0 13px rgba(34, 197, 94, 0.7);
+}
+
+.device-quota-copy strong {
+  letter-spacing: 0.07em;
+}
+
+.device-quota-copy span {
+  color: var(--muted-dark);
+}
+
+.device-quota-value strong {
+  color: var(--success);
+}
+
+.device-quota-reset strong {
+  color: var(--orange-light);
+}
+
+@media (max-width: 680px) {
+  .device-quota-card {
+    gap: 10px;
+  }
+}
+
+/* =========================================================
+   CLOUDFLARE TURNSTILE V11
+   ========================================================= */
+
+.turnstile-section {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.turnstile-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.turnstile-status > span:nth-child(2) {
+  color: var(--muted);
+  font-size: 7px;
+  font-weight: 950;
+  letter-spacing: 0.08em;
+}
+
+.turnstile-status small {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-dark);
+  font-size: 7px;
+}
+
+.turnstile-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: var(--muted-dark);
+}
+
+.turnstile-dot.ready {
+  background: var(--success);
+  box-shadow: 0 0 9px rgba(34, 197, 94, 0.55);
+}
+
+.turnstile-container {
+  width: 100%;
+  min-height: 0;
+  margin-top: 4px;
+}
+
+.turnstile-container iframe {
+  max-width: 100%;
+}
+
+@media (max-width: 680px) {
+  .turnstile-status {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .turnstile-status small {
+    width: 100%;
+    margin-left: 12px;
+    white-space: normal;
+    line-height: 1.4;
+  }
+}

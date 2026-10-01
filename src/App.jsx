@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
+import FingerprintJS from "@fingerprintjs/fingerprintjs";
 import "./App.css";
 
 import {
@@ -7,6 +8,8 @@ import {
   downloadBlob,
   formatBytes,
 } from "./audioProcessor";
+
+import { supabase } from "./lib/supabaseClient";
 
 const PRESETS = [
   { name: "BYPASS 1", speed: "0.43" },
@@ -21,6 +24,10 @@ const DEFAULT_CUSTOM_RATE = "0.43";
 const CUSTOM_MIN = 0.01;
 const CUSTOM_MAX = 20;
 const MAX_FILES = 50;
+const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || "0x4AAAAAAFK2H6hFanUq099w";
+const TURNSTILE_ACTION = "process_audio";
+const DEVICE_QUOTA_FUNCTION = "device-quota";
+const FREE_DAILY_LIMIT = 10;
 
 function createId(file, index) {
   return `${file.name}-${file.size}-${file.lastModified}-${index}-${Math.random()
@@ -35,6 +42,58 @@ function getBaseName(fileName) {
       .replace(/[^\w\- ]/g, "")
       .trim() || "audio"
   );
+}
+
+let turnstileScriptPromise = null;
+
+function loadTurnstileScript() {
+  if (window.turnstile) {
+    return Promise.resolve(window.turnstile);
+  }
+
+  if (turnstileScriptPromise) {
+    return turnstileScriptPromise;
+  }
+
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const existingScript = document.querySelector(
+      'script[data-gonaudio-turnstile="true"]'
+    );
+
+    if (existingScript) {
+      existingScript.addEventListener("load", () => {
+        if (window.turnstile) resolve(window.turnstile);
+        else reject(new Error("Cloudflare Turnstile tidak tersedia."));
+      });
+      existingScript.addEventListener("error", () => {
+        reject(new Error("Gagal memuat Cloudflare Turnstile."));
+      });
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src =
+      "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    script.async = true;
+    script.defer = true;
+    script.dataset.gonaudioTurnstile = "true";
+
+    script.onload = () => {
+      if (window.turnstile) {
+        resolve(window.turnstile);
+      } else {
+        reject(new Error("Cloudflare Turnstile tidak tersedia."));
+      }
+    };
+
+    script.onerror = () => {
+      reject(new Error("Gagal memuat Cloudflare Turnstile."));
+    };
+
+    document.head.appendChild(script);
+  });
+
+  return turnstileScriptPromise;
 }
 
 function Waveform({ file }) {
@@ -191,7 +250,22 @@ function App() {
   const [totalProgress, setTotalProgress] = useState(0);
   const [processingIndex, setProcessingIndex] = useState(0);
   const [batchResults, setBatchResults] = useState([]);
+  const [queueStatusById, setQueueStatusById] = useState({});
+  const [selectedResultIds, setSelectedResultIds] = useState([]);
+
+  const [deviceFingerprint, setDeviceFingerprint] = useState("");
+  const [deviceReady, setDeviceReady] = useState(false);
+  const [deviceLoading, setDeviceLoading] = useState(true);
+  const [deviceError, setDeviceError] = useState("");
+  const [quotaLoading, setQuotaLoading] = useState(false);
+  const [quotaUsed, setQuotaUsed] = useState(0);
+  const [quotaRemaining, setQuotaRemaining] = useState(0);
+  const [turnstileReady, setTurnstileReady] = useState(false);
+  const [turnstileError, setTurnstileError] = useState("");
   const [error, setError] = useState("");
+  const turnstileContainerRef = useRef(null);
+  const turnstileWidgetIdRef = useRef(null);
+  const turnstileResolverRef = useRef(null);
   const [previewFileId, setPreviewFileId] = useState(null);
   const [draggedQueueId, setDraggedQueueId] = useState(null);
   const [dragOverQueueId, setDragOverQueueId] = useState(null);
@@ -207,11 +281,344 @@ function App() {
   const activeProcessingSpeed = 1 / activeRobloxRate;
 
   useEffect(() => {
+    let mounted = true;
+
+    loadTurnstileScript()
+      .then((turnstile) => {
+        if (!mounted || !turnstileContainerRef.current) return;
+
+        const widgetId = turnstile.render(
+          turnstileContainerRef.current,
+          {
+            sitekey: TURNSTILE_SITE_KEY,
+            theme: "dark",
+            size: "flexible",
+            appearance: "interaction-only",
+            execution: "execute",
+            action: TURNSTILE_ACTION,
+            callback: (token) => {
+              setTurnstileReady(true);
+              const resolve = turnstileResolverRef.current;
+              turnstileResolverRef.current = null;
+              resolve?.(token);
+            },
+            "expired-callback": () => {
+              setTurnstileReady(false);
+              const reject = turnstileResolverRef.current;
+              turnstileResolverRef.current = null;
+              reject?.(
+                new Error(
+                  "Verifikasi keamanan kedaluwarsa. Coba lagi."
+                )
+              );
+            },
+            "error-callback": () => {
+              setTurnstileReady(false);
+              const reject = turnstileResolverRef.current;
+              turnstileResolverRef.current = null;
+              reject?.(
+                new Error(
+                  "Verifikasi Cloudflare gagal. Coba lagi."
+                )
+              );
+            },
+          }
+        );
+
+        if (mounted) {
+          turnstileWidgetIdRef.current = widgetId;
+          setTurnstileReady(true);
+        }
+      })
+      .catch((error) => {
+        console.error(error);
+        if (mounted) {
+          setTurnstileReady(false);
+          setTurnstileError(
+            error?.message ||
+              "Cloudflare Turnstile tidak dapat dimuat."
+          );
+        }
+      });
+
+    return () => {
+      mounted = false;
+      turnstileResolverRef.current = null;
+
+      if (
+        window.turnstile &&
+        turnstileWidgetIdRef.current !== null
+      ) {
+        try {
+          window.turnstile.remove(
+            turnstileWidgetIdRef.current
+          );
+        } catch {
+          // Ignore cleanup errors.
+        }
+      }
+
+      turnstileWidgetIdRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       pauseWaitersRef.current.forEach((resolve) => resolve());
       pauseWaitersRef.current = [];
     };
   }, []);
+
+
+  const callDeviceQuota = async (
+    action,
+    fingerprint = deviceFingerprint,
+    turnstileToken = ""
+  ) => {
+    if (!fingerprint) {
+      throw new Error(
+        "Device fingerprint belum siap."
+      );
+    }
+
+    const { data, error: functionError } =
+      await supabase.functions.invoke(
+        DEVICE_QUOTA_FUNCTION,
+        {
+          body: {
+            action,
+            visitorId: fingerprint,
+            turnstileToken,
+          },
+        }
+      );
+
+    if (functionError) {
+      throw functionError;
+    }
+
+    if (!data) {
+      throw new Error(
+        "Server quota tidak mengembalikan data."
+      );
+    }
+
+    return data;
+  };
+
+  const loadQuota = async (
+    currentFingerprint = deviceFingerprint
+  ) => {
+    if (!currentFingerprint) {
+      return null;
+    }
+
+    setQuotaLoading(true);
+
+    try {
+      const data = await callDeviceQuota(
+        "get",
+        currentFingerprint
+      );
+
+      if (!data.success) {
+        throw new Error(
+          data.message ||
+            "Gagal mengambil quota dari server."
+        );
+      }
+
+      const used = Math.max(
+        0,
+        Number(data.used) || 0
+      );
+
+      const remaining = Math.max(
+        0,
+        Number(data.remaining) || 0
+      );
+
+      setQuotaUsed(used);
+      setQuotaRemaining(remaining);
+      setDeviceError("");
+
+      return {
+        used,
+        remaining,
+        limit:
+          Number(data.limit) ||
+          FREE_DAILY_LIMIT,
+      };
+    } catch (quotaError) {
+      console.error(quotaError);
+
+      setDeviceError(
+        quotaError?.message ||
+          "Gagal mengambil quota dari server."
+      );
+
+      return null;
+    } finally {
+      setQuotaLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let mounted = true;
+
+    const initializeDevice = async () => {
+      setDeviceLoading(true);
+      setDeviceError("");
+
+      try {
+        const agent = await FingerprintJS.load({
+          monitoring: false,
+        });
+
+        const result = await agent.get();
+
+        if (!result?.visitorId) {
+          throw new Error(
+            "Fingerprint browser tidak tersedia."
+          );
+        }
+
+        if (!mounted) return;
+
+        setDeviceFingerprint(result.visitorId);
+        setDeviceReady(true);
+
+        await loadQuota(result.visitorId);
+      } catch (error) {
+        console.error(error);
+
+        if (!mounted) return;
+
+        setDeviceReady(false);
+        setDeviceError(
+          error?.message ||
+            "Gagal mengidentifikasi device."
+        );
+      } finally {
+        if (mounted) {
+          setDeviceLoading(false);
+        }
+      }
+    };
+
+    initializeDevice();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!deviceFingerprint) {
+      return;
+    }
+
+    loadQuota(deviceFingerprint);
+
+    const intervalId = window.setInterval(
+      () => {
+        loadQuota(deviceFingerprint);
+      },
+      60 * 1000
+    );
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [deviceFingerprint]);
+
+  const getTurnstileToken = async () => {
+    if (!window.turnstile) {
+      throw new Error(
+        "Cloudflare Turnstile belum siap. Refresh halaman dan coba lagi."
+      );
+    }
+
+    const widgetId = turnstileWidgetIdRef.current;
+
+    if (widgetId === null) {
+      throw new Error(
+        "Security widget belum siap. Refresh halaman dan coba lagi."
+      );
+    }
+
+    setTurnstileError("");
+    setTurnstileReady(false);
+
+    window.turnstile.reset(widgetId);
+
+    return await new Promise((resolve, reject) => {
+      turnstileResolverRef.current = (token) => {
+        if (!token) {
+          reject(
+            new Error(
+              "Token keamanan tidak valid. Coba lagi."
+            )
+          );
+          return;
+        }
+        resolve(token);
+      };
+
+      try {
+        window.turnstile.execute(widgetId);
+      } catch (error) {
+        turnstileResolverRef.current = null;
+        reject(error);
+      }
+    });
+  };
+
+  const consumeQuota = async (turnstileToken) => {
+    const data = await callDeviceQuota(
+      "consume",
+      deviceFingerprint,
+      turnstileToken
+    );
+
+    if (!data.success) {
+      const used = Math.max(
+        0,
+        Number(data.used) || 0
+      );
+      const remaining = Math.max(
+        0,
+        Number(data.remaining) || 0
+      );
+
+      setQuotaUsed(used);
+      setQuotaRemaining(remaining);
+
+      return {
+        success: false,
+        used,
+        remaining,
+      };
+    }
+
+    const used = Math.max(
+      0,
+      Number(data.used) || 0
+    );
+    const remaining = Math.max(
+      0,
+      Number(data.remaining) || 0
+    );
+
+    setQuotaUsed(used);
+    setQuotaRemaining(remaining);
+
+    return {
+      success: true,
+      used,
+      remaining,
+    };
+  };
 
   const isValidAudio = (file) => {
     return (
@@ -268,6 +675,8 @@ function App() {
     });
 
     setBatchResults([]);
+    setSelectedResultIds([]);
+    setQueueStatusById({});
     setProgress(0);
     setTotalProgress(0);
     setProcessingIndex(0);
@@ -321,7 +730,19 @@ function App() {
       setPreviewFileId(null);
     }
 
-    setBatchResults([]);
+    setQueueStatusById((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+
+    setSelectedResultIds((current) =>
+      current.filter((resultId) => resultId !== id)
+    );
+
+    setBatchResults((current) =>
+      current.filter((result) => result.id !== id)
+    );
     setError("");
     setProgress(0);
     setTotalProgress(0);
@@ -334,6 +755,8 @@ function App() {
     setSelectedFiles([]);
     setPreviewFileId(null);
     setBatchResults([]);
+    setQueueStatusById({});
+    setSelectedResultIds([]);
     setError("");
     setProgress(0);
     setTotalProgress(0);
@@ -465,6 +888,20 @@ function App() {
       current.filter((item) => !doneIds.has(item.id))
     );
 
+    setSelectedResultIds((current) =>
+      current.filter((resultId) => !doneIds.has(resultId))
+    );
+
+    setQueueStatusById((current) => {
+      const next = { ...current };
+
+      doneIds.forEach((id) => {
+        delete next[id];
+      });
+
+      return next;
+    });
+
     if (previewFileId && doneIds.has(previewFileId)) {
       setPreviewFileId(null);
     }
@@ -475,8 +912,156 @@ function App() {
     setProcessingIndex(0);
   };
 
+  const getDoneResults = () => {
+    return batchResults.filter(
+      (item) => item.status === "done" && item.blob
+    );
+  };
+
+  const toggleResultSelection = (id) => {
+    setSelectedResultIds((current) =>
+      current.includes(id)
+        ? current.filter((resultId) => resultId !== id)
+        : [...current, id]
+    );
+  };
+
+  const selectAllDoneResults = () => {
+    const doneIds = getDoneResults().map((item) => item.id);
+
+    setSelectedResultIds((current) => {
+      const allSelected =
+        doneIds.length > 0 &&
+        doneIds.every((id) => current.includes(id)) &&
+        current.length === doneIds.length;
+
+      return allSelected ? [] : doneIds;
+    });
+  };
+
+  const downloadResult = (item) => {
+    if (!item?.blob || !item?.outputName) {
+      return;
+    }
+
+    downloadBlob(item.blob, item.outputName);
+  };
+
+  const createZipBlob = async (items) => {
+    const zip = new JSZip();
+    const usedNames = new Map();
+
+    items.forEach((item) => {
+      const originalName = item.outputName;
+      const dotIndex = originalName.lastIndexOf(".");
+      const base =
+        dotIndex > 0
+          ? originalName.slice(0, dotIndex)
+          : originalName;
+      const extension =
+        dotIndex > 0
+          ? originalName.slice(dotIndex)
+          : "";
+
+      const count = usedNames.get(originalName) || 0;
+      usedNames.set(originalName, count + 1);
+
+      const uniqueName =
+        count === 0
+          ? originalName
+          : `${base} (${count + 1})${extension}`;
+
+      zip.file(uniqueName, item.blob);
+    });
+
+    return await zip.generateAsync({
+      type: "blob",
+      compression: "DEFLATE",
+      compressionOptions: { level: 6 },
+    });
+  };
+
+  const downloadSelectedAsZip = async () => {
+    const selected = getDoneResults().filter((item) =>
+      selectedResultIds.includes(item.id)
+    );
+
+    if (!selected.length) {
+      setError("Pilih minimal satu hasil untuk di-download.");
+      return;
+    }
+
+    try {
+      setError("");
+
+      const zipBlob = await createZipBlob(selected);
+
+      downloadBlob(
+        zipBlob,
+        `GonAUDIO_SELECTED_${selected.length}.zip`
+      );
+    } catch (err) {
+      console.error(err);
+      setError(
+        err?.message || "Gagal membuat ZIP pilihan."
+      );
+    }
+  };
+
+  const downloadAllAsZip = async () => {
+    const doneResults = getDoneResults();
+
+    if (!doneResults.length) {
+      setError("Belum ada hasil OGG yang bisa dimasukkan ke ZIP.");
+      return;
+    }
+
+    try {
+      setError("");
+
+      const zipBlob = await createZipBlob(doneResults);
+
+      downloadBlob(
+        zipBlob,
+        `GonAUDIO_${PRESETS[selectedPreset].name.replace(
+          /\s+/g,
+          "_"
+        )}_BATCH.zip`
+      );
+    } catch (err) {
+      console.error(err);
+      setError(
+        err?.message || "Gagal membuat file ZIP."
+      );
+    }
+  };
+
+  const clearResults = () => {
+    if (processing) return;
+
+    setBatchResults([]);
+    setSelectedResultIds([]);
+    setError("");
+  };
+
   const retryQueueItem = async (id) => {
     if (processing) return;
+
+    if (!deviceReady || !deviceFingerprint) {
+      setDeviceError(
+        "Device identification belum siap. Coba refresh halaman."
+      );
+      return;
+    }
+
+    const liveQuota = await loadQuota();
+
+    if (!liveQuota || liveQuota.remaining <= 0) {
+      setError(
+        "Kuota gratis hari ini sudah habis. Reset setiap 00:00 WIB."
+      );
+      return;
+    }
 
     const item = selectedFiles.find(
       (queueItem) => queueItem.id === id
@@ -510,6 +1095,11 @@ function App() {
     setProcessingIndex(Math.max(0, itemIndex));
     setProgress(0);
     setTotalProgress(0);
+
+    setQueueStatusById((current) => ({
+      ...current,
+      [id]: "processing",
+    }));
 
     setBatchResults((current) =>
       current.map((result) =>
@@ -554,7 +1144,42 @@ function App() {
         item.file.name
       )}_GonAUDIO_${safePresetName}.ogg`;
 
+      const turnstileToken = await getTurnstileToken();
+
+      const retryQuotaResult = await consumeQuota(
+        turnstileToken
+      );
+
+      if (!retryQuotaResult.success) {
+        setQueueStatusById((current) => ({
+          ...current,
+          [id]: "waiting",
+        }));
+
+        setBatchResults((current) =>
+          current.map((resultItem) =>
+            resultItem.id === id
+              ? {
+                  ...resultItem,
+                  status: "waiting",
+                }
+              : resultItem
+          )
+        );
+
+        setError(
+          "Kuota gratis hari ini sudah habis. Reset setiap 00:00 WIB."
+        );
+
+        return;
+      }
+
       downloadBlob(result.blob, outputName);
+
+      setQueueStatusById((current) => ({
+        ...current,
+        [id]: "done",
+      }));
 
       setBatchResults((current) =>
         current.map((resultItem) =>
@@ -575,6 +1200,11 @@ function App() {
       setTotalProgress(100);
     } catch (retryError) {
       if (retryError?.name === "AbortError") {
+        setQueueStatusById((current) => ({
+          ...current,
+          [id]: "cancelled",
+        }));
+
         setBatchResults((current) =>
           current.map((result) =>
             result.id === id
@@ -589,6 +1219,11 @@ function App() {
         setError("Retry dibatalkan.");
       } else {
         console.error(retryError);
+
+        setQueueStatusById((current) => ({
+          ...current,
+          [id]: "error",
+        }));
 
         setBatchResults((current) =>
           current.map((result) =>
@@ -627,6 +1262,7 @@ function App() {
 
   const getQueueStatus = (id) => {
     return (
+      queueStatusById[id] ||
       batchResults.find((item) => item.id === id)?.status ||
       "waiting"
     );
@@ -693,47 +1329,14 @@ function App() {
     resumePauseWaiters();
   };
 
-  const downloadAllAsZip = async () => {
-    const doneResults = batchResults.filter(
-      (item) => item.status === "done" && item.blob
-    );
-
-    if (!doneResults.length) {
-      setError("Belum ada hasil OGG yang bisa dimasukkan ke ZIP.");
+  const handleProcess = async () => {
+    if (!deviceReady || !deviceFingerprint) {
+      setDeviceError(
+        "Device identification belum siap. Coba refresh halaman."
+      );
       return;
     }
 
-    try {
-      setError("");
-
-      const zip = new JSZip();
-
-      doneResults.forEach((item) => {
-        zip.file(item.outputName, item.blob);
-      });
-
-      const zipBlob = await zip.generateAsync({
-        type: "blob",
-        compression: "DEFLATE",
-        compressionOptions: { level: 6 },
-      });
-
-      downloadBlob(
-        zipBlob,
-        `GonAUDIO_${PRESETS[selectedPreset].name.replace(
-          /\s+/g,
-          "_"
-        )}_BATCH.zip`
-      );
-    } catch (err) {
-      console.error(err);
-      setError(
-        err?.message || "Gagal membuat file ZIP."
-      );
-    }
-  };
-
-  const handleProcess = async () => {
     if (!selectedFiles.length) {
       setError("Upload audio terlebih dahulu.");
       return;
@@ -753,6 +1356,31 @@ function App() {
       return;
     }
 
+    const liveQuota = await loadQuota();
+
+    if (!liveQuota || liveQuota.remaining <= 0) {
+      setError(
+        "Kuota gratis hari ini sudah habis. Reset setiap 00:00 WIB."
+      );
+      return;
+    }
+
+    const processableItems = selectedFiles.slice(
+      0,
+      liveQuota.remaining
+    );
+
+    if (
+      processableItems.length <
+      selectedFiles.length
+    ) {
+      setError(
+        `Sisa quota ${liveQuota.remaining}x. Hanya ${processableItems.length} audio yang diproses pada batch ini.`
+      );
+    } else {
+      setError("");
+    }
+
     cancelRef.current = false;
     pauseRef.current = false;
 
@@ -763,6 +1391,13 @@ function App() {
     setProgress(0);
     setTotalProgress(0);
     setProcessingIndex(0);
+    setSelectedResultIds([]);
+
+    const initialStatus = Object.fromEntries(
+      selectedFiles.map((item) => [item.id, "waiting"])
+    );
+
+    setQueueStatusById(initialStatus);
 
     const initialResults = selectedFiles.map((item) => ({
       id: item.id,
@@ -779,17 +1414,26 @@ function App() {
     const safePresetName = preset.name.replace(/\s+/g, "_");
 
     try {
-      for (let index = 0; index < selectedFiles.length; index += 1) {
+      for (
+        let index = 0;
+        index < processableItems.length;
+        index += 1
+      ) {
         await waitWhilePaused();
 
         if (cancelRef.current) {
           break;
         }
 
-        const item = selectedFiles[index];
+        const item = processableItems[index];
         const file = item.file;
 
         setProcessingIndex(index);
+        setQueueStatusById((current) => ({
+          ...current,
+          [item.id]: "processing",
+        }));
+
         setBatchResults((current) =>
           current.map((result) =>
             result.id === item.id
@@ -804,7 +1448,9 @@ function App() {
 
         setProgress(0);
         setTotalProgress(
-          Math.round((index / selectedFiles.length) * 100)
+          Math.round(
+            (index / processableItems.length) * 100
+          )
         );
 
         try {
@@ -818,7 +1464,7 @@ function App() {
 
               const batchProgress =
                 ((index + numericProgress / 100) /
-                  selectedFiles.length) *
+                  processableItems.length) *
                 100;
 
               setTotalProgress(
@@ -842,6 +1488,41 @@ function App() {
             file.name
           )}_GonAUDIO_${safePresetName}.ogg`;
 
+          const turnstileToken = await getTurnstileToken();
+
+          const quotaResult = await consumeQuota(
+            turnstileToken
+          );
+
+          if (!quotaResult.success) {
+            setQueueStatusById((current) => ({
+              ...current,
+              [item.id]: "waiting",
+            }));
+
+            setBatchResults((current) =>
+              current.map((resultItem) =>
+                resultItem.id === item.id
+                  ? {
+                      ...resultItem,
+                      status: "waiting",
+                    }
+                  : resultItem
+              )
+            );
+
+            setError(
+              "Kuota gratis habis. Reset setiap 00:00 WIB."
+            );
+
+            break;
+          }
+
+          setQueueStatusById((current) => ({
+            ...current,
+            [item.id]: "done",
+          }));
+
           setBatchResults((current) =>
             current.map((resultItem) =>
               resultItem.id === item.id
@@ -863,6 +1544,11 @@ function App() {
 
           console.error(fileError);
 
+          setQueueStatusById((current) => ({
+            ...current,
+            [item.id]: "error",
+          }));
+
           setBatchResults((current) =>
             current.map((resultItem) =>
               resultItem.id === item.id
@@ -880,6 +1566,21 @@ function App() {
       }
 
       if (cancelRef.current) {
+        setQueueStatusById((current) => {
+          const next = { ...current };
+
+          Object.keys(next).forEach((id) => {
+            if (
+              next[id] === "waiting" ||
+              next[id] === "processing"
+            ) {
+              next[id] = "cancelled";
+            }
+          });
+
+          return next;
+        });
+
         setBatchResults((current) =>
           current.map((item) =>
             item.status === "waiting" || item.status === "processing"
@@ -915,6 +1616,7 @@ function App() {
       pauseRef.current = false;
       cancelRef.current = false;
       resumePauseWaiters();
+      await loadQuota();
     }
   };
 
@@ -924,6 +1626,11 @@ function App() {
   const doneCount = batchResults.filter(
     (item) => item.status === "done"
   ).length;
+
+  const processableCount = Math.min(
+    selectedFiles.length,
+    quotaRemaining
+  );
 
   const hasDoneResults = doneCount > 0;
 
@@ -937,7 +1644,7 @@ function App() {
         <section className="hero">
           <div className="version-badge">
             <span className="badge-dot" />
-            AUDIO PROCESSING V2.0
+            AUDIO PROCESSING V10.0
           </div>
 
           <h1>
@@ -951,6 +1658,42 @@ function App() {
             <br />
             YANG DISESUAIKAN — DIBUAT UNTUK WORKFLOW AUDIO ROBLOX
           </p>
+        </section>
+
+        {/* DEVICE QUOTA */}
+        <section className="device-quota-section">
+          <div className="device-quota-card">
+            <div className="device-quota-main">
+              <div className="device-quota-indicator">
+                <span />
+              </div>
+
+              <div className="device-quota-copy">
+                <strong>DEVICE IDENTIFICATION ACTIVE</strong>
+
+                <span>
+                  {deviceLoading
+                    ? "Identifying this browser..."
+                    : deviceError
+                      ? deviceError
+                      : "This browser has its own server-side free processing quota."}
+                </span>
+              </div>
+            </div>
+
+            <div className="device-quota-value">
+              <small>FREE TODAY</small>
+
+              <strong>
+                {quotaLoading ? "..." : `${quotaRemaining}/10`}
+              </strong>
+            </div>
+
+            <div className="device-quota-reset">
+              RESET
+              <strong>00:00 WIB</strong>
+            </div>
+          </div>
         </section>
 
         {/* MAIN WORKSPACE */}
@@ -1466,29 +2209,76 @@ function App() {
               </div>
             )}
 
+            {/* SECURITY CHECK */}
+            <div className="turnstile-section">
+              <div className="turnstile-status">
+                <span
+                  className={
+                    turnstileReady
+                      ? "turnstile-dot ready"
+                      : "turnstile-dot"
+                  }
+                />
+                <span>SECURITY CHECK</span>
+                <small>
+                  {turnstileError
+                    ? turnstileError
+                    : "Cloudflare protection is checked before quota is consumed."}
+                </small>
+              </div>
+
+              <div
+                ref={turnstileContainerRef}
+                className="turnstile-container"
+              />
+            </div>
+
             {/* PROCESS BUTTON */}
             <button
               type="button"
               className={`process-button ${
-                !selectedFiles.length || processing
+                !selectedFiles.length ||
+                processing ||
+                !deviceReady ||
+                
+                quotaLoading ||
+                quotaRemaining <= 0
                   ? "disabled"
                   : ""
               }`}
               onClick={handleProcess}
-              disabled={!selectedFiles.length || processing}
+              disabled={
+                !selectedFiles.length ||
+                processing ||
+                !deviceReady ||
+                
+                quotaLoading ||
+                quotaRemaining <= 0
+              }
             >
               <span>{processing ? "⚙" : "✦"}</span>
 
               {processing
                 ? `PROCESSING ${
                     processingIndex + 1
-                  }/${selectedFiles.length}`
-                : `PROCESS QUEUE • ${selectedFiles.length}` }
+                  }/${processableCount}`
+                : deviceLoading || quotaLoading
+                  ? "CHECKING DEVICE QUOTA"
+                  : !deviceReady || !deviceFingerprint
+                    ? "DEVICE IDENTIFICATION UNAVAILABLE"
+                    : quotaRemaining <= 0
+                      ? "DAILY LIMIT REACHED"
+                      : `PROCESS QUEUE • ${
+                          Math.min(
+                            selectedFiles.length,
+                            quotaRemaining
+                          )
+                        }`}
 
               <span>{processing ? "…" : "→"}</span>
             </button>
 
-            {/* QUEUE RESULTS */}
+            {/* PROCESSING RESULTS */}
             {batchResults.length > 0 && !processing && (
               <div className="batch-results">
                 <div className="batch-results-header">
@@ -1507,16 +2297,6 @@ function App() {
                       <span className="retry-hint">
                         FAILED TRACKS CAN BE RETRIED
                       </span>
-                    )}
-
-                    {hasDoneResults && (
-                      <button
-                        type="button"
-                        className="zip-button"
-                        onClick={downloadAllAsZip}
-                      >
-                        ↓ DOWNLOAD ALL ZIP
-                      </button>
                     )}
                   </div>
                 </div>
@@ -1558,13 +2338,123 @@ function App() {
                           onClick={() =>
                             retryQueueItem(item.id)
                           }
-                          disabled={processing}
+                          disabled={
+                            processing ||
+                            !deviceReady ||
+                            
+                            quotaLoading ||
+                            quotaRemaining <= 0
+                          }
                         >
                           RETRY
                         </button>
                       )}
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+
+            {/* DOWNLOAD MANAGER */}
+            {hasDoneResults && !processing && (
+              <div className="download-manager">
+                <div className="download-manager-header">
+                  <div>
+                    <strong>DOWNLOAD MANAGER</strong>
+
+                    <span>
+                      {doneCount} FILE
+                      {doneCount === 1 ? "" : "S"} READY
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="clear-results-button"
+                    onClick={clearResults}
+                    disabled={processing}
+                  >
+                    CLEAR RESULTS
+                  </button>
+                </div>
+
+                <div className="download-manager-toolbar">
+                  <button
+                    type="button"
+                    className="select-results-button"
+                    onClick={selectAllDoneResults}
+                  >
+                    {selectedResultIds.length === doneCount &&
+                    doneCount > 0
+                      ? "CLEAR SELECTION"
+                      : "SELECT ALL"}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="download-selected-button"
+                    onClick={downloadSelectedAsZip}
+                    disabled={!selectedResultIds.length}
+                  >
+                    ↓ DOWNLOAD SELECTED ZIP
+                  </button>
+
+                  <button
+                    type="button"
+                    className="download-all-button"
+                    onClick={downloadAllAsZip}
+                  >
+                    ↓ DOWNLOAD ALL ZIP
+                  </button>
+                </div>
+
+                <div className="download-manager-list">
+                  {getDoneResults().map((item) => {
+                    const selected =
+                      selectedResultIds.includes(item.id);
+
+                    return (
+                      <div
+                        className={`download-item ${
+                          selected ? "selected" : ""
+                        }`}
+                        key={item.id}
+                      >
+                        <label className="download-check">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() =>
+                              toggleResultSelection(item.id)
+                            }
+                          />
+
+                          <span />
+                        </label>
+
+                        <div className="download-item-info">
+                          <strong title={item.outputName}>
+                            {item.fileName}
+                          </strong>
+
+                          <small>
+                            {item.outputName} •{" "}
+                            {formatBytes(item.size)}
+                          </small>
+                        </div>
+
+                        <button
+                          type="button"
+                          className="download-one-button"
+                          onClick={() =>
+                            downloadResult(item)
+                          }
+                        >
+                          DOWNLOAD
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1581,9 +2471,11 @@ function App() {
         <footer>
           <span>GONAUDIO</span>
           <span>•</span>
-          <span>AUDIO PROCESSOR V2.0</span>
+          <span>AUDIO PROCESSOR V10.0</span>
           <span>•</span>
-          <span>FREE 0/∞</span>
+          <span>
+            DEVICE FREE {quotaRemaining}/10
+          </span>
           <span>•</span>
           <span>PRIVACY</span>
           <span>•</span>

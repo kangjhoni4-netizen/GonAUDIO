@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@audio/encode-ogg": "^1.3.0",
+    "@fingerprintjs/fingerprintjs": "^5.2.0",
+    "@supabase/supabase-js": "^2.117.2",
     "jszip": "^3.10.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
