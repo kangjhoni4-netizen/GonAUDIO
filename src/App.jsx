@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import JSZip from "jszip";
 import FingerprintJS from "@fingerprintjs/fingerprintjs";
 import "./App.css";
+import AdminPanel from "./AdminPanel";
 
 import {
   processAudio,
@@ -27,7 +28,7 @@ const MAX_FILES = 50;
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || "0x4AAAAAAFK2H6hFanUq099w";
 const TURNSTILE_ACTION = "process_audio";
 const DEVICE_QUOTA_FUNCTION = "device-quota";
-const FREE_DAILY_LIMIT = 10;
+const DEFAULT_FREE_DAILY_LIMIT = 10;
 
 function createId(file, index) {
   return `${file.name}-${file.size}-${file.lastModified}-${index}-${Math.random()
@@ -230,7 +231,7 @@ function PreviewAudio({ file }) {
   );
 }
 
-function App() {
+function PublicApp() {
   const fileInputRef = useRef(null);
   const cancelRef = useRef(false);
   const pauseRef = useRef(false);
@@ -260,6 +261,7 @@ function App() {
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [quotaUsed, setQuotaUsed] = useState(0);
   const [quotaRemaining, setQuotaRemaining] = useState(0);
+  const [quotaLimit, setQuotaLimit] = useState(DEFAULT_FREE_DAILY_LIMIT);
   const [turnstileReady, setTurnstileReady] = useState(false);
   const [turnstileError, setTurnstileError] = useState("");
   const [error, setError] = useState("");
@@ -438,16 +440,21 @@ function App() {
         Number(data.remaining) || 0
       );
 
+      const limitValue = Number(data.limit);
+      const limit =
+        Number.isFinite(limitValue) && limitValue >= 0
+          ? limitValue
+          : DEFAULT_FREE_DAILY_LIMIT;
+
       setQuotaUsed(used);
       setQuotaRemaining(remaining);
+      setQuotaLimit(limit);
       setDeviceError("");
 
       return {
         used,
         remaining,
-        limit:
-          Number(data.limit) ||
-          FREE_DAILY_LIMIT,
+        limit,
       };
     } catch (quotaError) {
       console.error(quotaError);
@@ -591,13 +598,21 @@ function App() {
         Number(data.remaining) || 0
       );
 
+      const limitValue = Number(data.limit);
+      const limit =
+        Number.isFinite(limitValue) && limitValue >= 0
+          ? limitValue
+          : DEFAULT_FREE_DAILY_LIMIT;
+
       setQuotaUsed(used);
       setQuotaRemaining(remaining);
+      setQuotaLimit(limit);
 
       return {
         success: false,
         used,
         remaining,
+        limit,
       };
     }
 
@@ -610,13 +625,21 @@ function App() {
       Number(data.remaining) || 0
     );
 
+    const limitValue = Number(data.limit);
+    const limit =
+      Number.isFinite(limitValue) && limitValue >= 0
+        ? limitValue
+        : DEFAULT_FREE_DAILY_LIMIT;
+
     setQuotaUsed(used);
     setQuotaRemaining(remaining);
+    setQuotaLimit(limit);
 
     return {
       success: true,
       used,
       remaining,
+      limit,
     };
   };
 
@@ -1685,7 +1708,7 @@ function App() {
               <small>FREE TODAY</small>
 
               <strong>
-                {quotaLoading ? "..." : `${quotaRemaining}/10`}
+                {quotaLoading ? "..." : `${quotaRemaining}/${quotaLimit}`}
               </strong>
             </div>
 
@@ -2474,7 +2497,7 @@ function App() {
           <span>AUDIO PROCESSOR V10.0</span>
           <span>•</span>
           <span>
-            DEVICE FREE {quotaRemaining}/10
+            DEVICE FREE {quotaRemaining}/{quotaLimit}
           </span>
           <span>•</span>
           <span>PRIVACY</span>
@@ -2484,6 +2507,28 @@ function App() {
       </main>
     </div>
   );
+}
+
+function App() {
+  const [isAdminRoute, setIsAdminRoute] = useState(
+    () => window.location.hash.toLowerCase() === "#admin"
+  );
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setIsAdminRoute(
+        window.location.hash.toLowerCase() === "#admin"
+      );
+    };
+
+    window.addEventListener("hashchange", handleHashChange);
+
+    return () => {
+      window.removeEventListener("hashchange", handleHashChange);
+    };
+  }, []);
+
+  return isAdminRoute ? <AdminPanel /> : <PublicApp />;
 }
 
 export default App;
