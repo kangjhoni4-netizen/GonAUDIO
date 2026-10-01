@@ -193,6 +193,8 @@ function App() {
   const [batchResults, setBatchResults] = useState([]);
   const [error, setError] = useState("");
   const [previewFileId, setPreviewFileId] = useState(null);
+  const [draggedQueueId, setDraggedQueueId] = useState(null);
+  const [dragOverQueueId, setDragOverQueueId] = useState(null);
 
   const preset = PRESETS[selectedPreset];
   const parsedCustomRobloxRate = Number(customRobloxRate);
@@ -282,6 +284,23 @@ function App() {
     }
   };
 
+  const formatSize = (bytes) => {
+    if (!bytes) {
+      return "0 KB";
+    }
+
+    const mb = bytes / 1024 / 1024;
+
+    if (mb >= 1) {
+      return `${mb.toFixed(2)} MB`;
+    }
+
+    return `${Math.max(
+      1,
+      Math.round(bytes / 1024)
+    )} KB`;
+  };
+
   const handleDrop = (event) => {
     event.preventDefault();
     setDragging(false);
@@ -319,6 +338,298 @@ function App() {
     setProgress(0);
     setTotalProgress(0);
     setProcessingIndex(0);
+  };
+
+  const moveQueueItem = (id, direction) => {
+    if (processing) return;
+
+    setSelectedFiles((current) => {
+      const index = current.findIndex((item) => item.id === id);
+
+      if (index === -1) {
+        return current;
+      }
+
+      const nextIndex = index + direction;
+
+      if (nextIndex < 0 || nextIndex >= current.length) {
+        return current;
+      }
+
+      const next = [...current];
+      const [movedItem] = next.splice(index, 1);
+      next.splice(nextIndex, 0, movedItem);
+
+      return next;
+    });
+
+    setError("");
+    setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
+  };
+
+  const handleQueueDragStart = (event, id) => {
+    if (processing) return;
+
+    setDraggedQueueId(id);
+    setDragOverQueueId(null);
+
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", id);
+    }
+  };
+
+  const handleQueueDragOver = (event, id) => {
+    if (processing || !draggedQueueId || draggedQueueId === id) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "move";
+    }
+
+    setDragOverQueueId(id);
+  };
+
+  const handleQueueDrop = (event, targetId) => {
+    event.preventDefault();
+
+    if (
+      processing ||
+      !draggedQueueId ||
+      draggedQueueId === targetId
+    ) {
+      setDraggedQueueId(null);
+      setDragOverQueueId(null);
+      return;
+    }
+
+    setSelectedFiles((current) => {
+      const fromIndex = current.findIndex(
+        (item) => item.id === draggedQueueId
+      );
+      const toIndex = current.findIndex(
+        (item) => item.id === targetId
+      );
+
+      if (
+        fromIndex === -1 ||
+        toIndex === -1 ||
+        fromIndex === toIndex
+      ) {
+        return current;
+      }
+
+      const next = [...current];
+      const [movedItem] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, movedItem);
+
+      return next;
+    });
+
+    setDraggedQueueId(null);
+    setDragOverQueueId(null);
+    setError("");
+    setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
+  };
+
+  const handleQueueDragEnd = () => {
+    setDraggedQueueId(null);
+    setDragOverQueueId(null);
+  };
+
+  const clearDone = () => {
+    if (processing) return;
+
+    const doneIds = new Set(
+      batchResults
+        .filter((item) => item.status === "done")
+        .map((item) => item.id)
+    );
+
+    if (!doneIds.size) {
+      return;
+    }
+
+    setSelectedFiles((current) =>
+      current.filter((item) => !doneIds.has(item.id))
+    );
+
+    setBatchResults((current) =>
+      current.filter((item) => !doneIds.has(item.id))
+    );
+
+    if (previewFileId && doneIds.has(previewFileId)) {
+      setPreviewFileId(null);
+    }
+
+    setError("");
+    setProgress(0);
+    setTotalProgress(0);
+    setProcessingIndex(0);
+  };
+
+  const retryQueueItem = async (id) => {
+    if (processing) return;
+
+    const item = selectedFiles.find(
+      (queueItem) => queueItem.id === id
+    );
+
+    if (!item) {
+      return;
+    }
+
+    if (
+      !Number.isFinite(activeRobloxRate) ||
+      activeRobloxRate <= 0 ||
+      !Number.isFinite(activeProcessingSpeed) ||
+      activeProcessingSpeed <= 0
+    ) {
+      setError("Target playback rate Roblox tidak valid.");
+      return;
+    }
+
+    cancelRef.current = false;
+    pauseRef.current = false;
+
+    const itemIndex = selectedFiles.findIndex(
+      (queueItem) => queueItem.id === id
+    );
+
+    setProcessing(true);
+    setPaused(false);
+    setCancelRequested(false);
+    setError("");
+    setProcessingIndex(Math.max(0, itemIndex));
+    setProgress(0);
+    setTotalProgress(0);
+
+    setBatchResults((current) =>
+      current.map((result) =>
+        result.id === id
+          ? {
+              ...result,
+              status: "processing",
+              error: "",
+            }
+          : result
+      )
+    );
+
+    const safePresetName = preset.name.replace(
+      /\s+/g,
+      "_"
+    );
+
+    try {
+      const result = await processAudio(
+        item.file,
+        activeProcessingSpeed,
+        (fileProgress) => {
+          const numericProgress = Number(fileProgress) || 0;
+          setProgress(numericProgress);
+          setTotalProgress(numericProgress);
+        },
+        {
+          signal: {
+            get aborted() {
+              return cancelRef.current;
+            },
+          },
+        }
+      );
+
+      if (cancelRef.current) {
+        return;
+      }
+
+      const outputName = `${getBaseName(
+        item.file.name
+      )}_GonAUDIO_${safePresetName}.ogg`;
+
+      downloadBlob(result.blob, outputName);
+
+      setBatchResults((current) =>
+        current.map((resultItem) =>
+          resultItem.id === id
+            ? {
+                ...resultItem,
+                status: "done",
+                outputName,
+                size: result.size,
+                blob: result.blob,
+                error: "",
+              }
+            : resultItem
+        )
+      );
+
+      setProgress(100);
+      setTotalProgress(100);
+    } catch (retryError) {
+      if (retryError?.name === "AbortError") {
+        setBatchResults((current) =>
+          current.map((result) =>
+            result.id === id
+              ? {
+                  ...result,
+                  status: "cancelled",
+                }
+              : result
+          )
+        );
+
+        setError("Retry dibatalkan.");
+      } else {
+        console.error(retryError);
+
+        setBatchResults((current) =>
+          current.map((result) =>
+            result.id === id
+              ? {
+                  ...result,
+                  status: "error",
+                  error:
+                    retryError?.message ||
+                    "Retry gagal memproses audio.",
+                }
+              : result
+          )
+        );
+
+        setError(
+          retryError?.message ||
+            "Retry gagal memproses audio."
+        );
+      }
+    } finally {
+      const wasCanceled = cancelRef.current;
+
+      setProcessing(false);
+      setPaused(false);
+      setCancelRequested(false);
+      setProcessingIndex(0);
+      setProgress(wasCanceled ? 0 : 100);
+      setTotalProgress(wasCanceled ? 0 : 100);
+
+      pauseRef.current = false;
+      cancelRef.current = false;
+      resumePauseWaiters();
+    }
+  };
+
+  const getQueueStatus = (id) => {
+    return (
+      batchResults.find((item) => item.id === id)?.status ||
+      "waiting"
+    );
   };
 
   const handlePresetChange = (index) => {
@@ -644,12 +955,10 @@ function App() {
 
         {/* MAIN WORKSPACE */}
         <section className="workspace">
-          {/* UPLOAD + BATCH PREVIEW */}
+          {/* UPLOAD */}
           <div className="upload-section">
             <div
-              className={`upload-box ${dragging ? "dragging" : ""} ${
-                selectedFiles.length ? "has-files" : ""
-              }`}
+              className={`upload-box ${dragging ? "dragging" : ""}`}
               onDragOver={(event) => {
                 event.preventDefault();
 
@@ -670,102 +979,207 @@ function App() {
                 hidden
               />
 
-              {selectedFiles.length === 0 ? (
+              <div className="upload-icon" />
+
+              <h2>Upload your audio</h2>
+
+              <p>
+                Drag & drop atau klik di sini untuk{" "}
+                <span>browse</span>
+              </p>
+
+              <div className="formats">
+                MP3&nbsp;&nbsp;•&nbsp;&nbsp;
+                WAV&nbsp;&nbsp;•&nbsp;&nbsp;
+                OGG&nbsp;&nbsp;•&nbsp;&nbsp;
+                FLAC&nbsp;&nbsp;•&nbsp;&nbsp;
+                M4A&nbsp;&nbsp;•&nbsp;&nbsp;
+                MP4
+              </div>
+            </div>
+
+            {/* QUEUE */}
+            <div className="queue-panel">
+              <div className="queue-panel-header">
+                <div>
+                  <strong>
+                    QUEUE • {selectedFiles.length} TRACK
+                    {selectedFiles.length === 1 ? "" : "S"}
+                  </strong>
+
+                  <small>
+                    {batchResults.length
+                      ? `${batchResults.filter(
+                          (item) => item.status === "done"
+                        ).length} DONE • ${batchResults.filter(
+                          (item) => item.status === "processing"
+                        ).length} PROCESSING • ${batchResults.filter(
+                          (item) => item.status === "waiting"
+                        ).length} WAITING • ${batchResults.filter(
+                          (item) => item.status === "error"
+                        ).length} ERROR`
+                      : "Drag the handle to reorder the Queue."}
+                  </small>
+                </div>
+
+                <div className="queue-header-actions">
+                  <button
+                    type="button"
+                    className="clear-done-button"
+                    onClick={clearDone}
+                    disabled={
+                      processing ||
+                      !batchResults.some(
+                        (item) => item.status === "done"
+                      )
+                    }
+                  >
+                    CLEAR DONE
+                  </button>
+
+                  <button
+                    type="button"
+                    className="add-more-button"
+                    onClick={openFilePicker}
+                    disabled={processing}
+                  >
+                    + ADD TO QUEUE
+                  </button>
+                </div>
+              </div>
+
+              {selectedFiles.length > 0 ? (
                 <>
-                  <div className="upload-icon" />
+                  <div className="queue-list">
+                    {selectedFiles.map((item, index) => {
+                      const status = getQueueStatus(item.id);
 
-                  <h2>Upload your audio</h2>
-
-                  <p>
-                    Drag & drop atau klik di sini untuk{" "}
-                    <span>browse</span>
-                  </p>
-
-                  <div className="formats">
-                    MP3&nbsp;&nbsp;•&nbsp;&nbsp;
-                    WAV&nbsp;&nbsp;•&nbsp;&nbsp;
-                    OGG&nbsp;&nbsp;•&nbsp;&nbsp;
-                    FLAC&nbsp;&nbsp;•&nbsp;&nbsp;
-                    M4A&nbsp;&nbsp;•&nbsp;&nbsp;
-                    MP4
-                  </div>
-                </>
-              ) : (
-                <div
-                  className="batch-upload-content"
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <div className="batch-upload-top">
-                    <div>
-                      <strong>
-                        {selectedFiles.length} AUDIO SELECTED
-                      </strong>
-
-                      <small>
-                        Maksimal {MAX_FILES} file per batch
-                      </small>
-                    </div>
-
-                    <button
-                      type="button"
-                      className="add-more-button"
-                      onClick={openFilePicker}
-                      disabled={processing}
-                    >
-                      + ADD MORE
-                    </button>
-                  </div>
-
-                  <div className="selected-files">
-                    {selectedFiles.map((item) => (
-                      <div
-                        className={`selected-file ${
-                          previewFileId === item.id
-                            ? "preview-active"
-                            : ""
-                        }`}
-                        key={item.id}
-                      >
-                        <button
-                          type="button"
-                          className="file-main"
-                          onClick={() =>
-                            setPreviewFileId((current) =>
-                              current === item.id
-                                ? null
-                                : item.id
-                            )
+                      return (
+                        <div
+                          className={`queue-item ${
+                            previewFileId === item.id
+                              ? "preview-active"
+                              : ""
+                          } ${
+                            dragOverQueueId === item.id
+                              ? "drag-over"
+                              : ""
+                          } ${status}`}
+                          key={item.id}
+                          onDragOver={(event) =>
+                            handleQueueDragOver(event, item.id)
                           }
-                          title="Preview audio"
+                          onDrop={(event) =>
+                            handleQueueDrop(event, item.id)
+                          }
                         >
-                          <span className="file-play-icon">
-                            {previewFileId === item.id
-                              ? "❚❚"
-                              : "▶"}
+                          <span
+                            className={`queue-drag-handle ${
+                              draggedQueueId === item.id
+                                ? "dragging"
+                                : ""
+                            }`}
+                            draggable={!processing}
+                            onDragStart={(event) =>
+                              handleQueueDragStart(
+                                event,
+                                item.id
+                              )
+                            }
+                            onDragEnd={handleQueueDragEnd}
+                            title="Drag to reorder"
+                          >
+                            ⋮⋮
                           </span>
 
-                          <span className="file-text">
-                            <strong title={item.file.name}>
-                              {item.file.name}
-                            </strong>
-
-                            <small>
-                              {formatBytes(item.file.size)}
-                            </small>
+                          <span className="queue-index">
+                            {index + 1}
                           </span>
-                        </button>
 
-                        <button
-                          type="button"
-                          className="remove-file"
-                          onClick={() => removeFile(item.id)}
-                          disabled={processing}
-                          aria-label={`Remove ${item.file.name}`}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
+                          <button
+                            type="button"
+                            className="file-main"
+                            onClick={() =>
+                              setPreviewFileId((current) =>
+                                current === item.id
+                                  ? null
+                                  : item.id
+                              )
+                            }
+                            title="Preview audio"
+                          >
+                            <span className="file-play-icon">
+                              {previewFileId === item.id
+                                ? "❚❚"
+                                : "▶"}
+                            </span>
+
+                            <span className="file-text">
+                              <strong title={item.file.name}>
+                                {item.file.name}
+                              </strong>
+
+                              <small>
+                                {formatSize(item.file.size)}
+                              </small>
+                            </span>
+                          </button>
+
+                          <span className={`queue-status ${status}`}>
+                            {status === "done"
+                              ? "DONE"
+                              : status === "error"
+                                ? "ERROR"
+                                : status === "processing"
+                                  ? "PROCESSING"
+                                  : status === "cancelled"
+                                    ? "CANCELLED"
+                                    : "WAITING"}
+                          </span>
+
+                          <div className="queue-reorder">
+                            <button
+                              type="button"
+                              className="queue-arrow"
+                              onClick={() =>
+                                moveQueueItem(item.id, -1)
+                              }
+                              disabled={
+                                processing || index === 0
+                              }
+                              aria-label={`Move ${item.file.name} up`}
+                            >
+                              ↑
+                            </button>
+
+                            <button
+                              type="button"
+                              className="queue-arrow"
+                              onClick={() =>
+                                moveQueueItem(item.id, 1)
+                              }
+                              disabled={
+                                processing ||
+                                index === selectedFiles.length - 1
+                              }
+                              aria-label={`Move ${item.file.name} down`}
+                            >
+                              ↓
+                            </button>
+                          </div>
+
+                          <button
+                            type="button"
+                            className="remove-file"
+                            onClick={() => removeFile(item.id)}
+                            disabled={processing}
+                            aria-label={`Remove ${item.file.name}`}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
 
                   {activePreviewItem && (
@@ -801,6 +1215,13 @@ function App() {
                       CLEAR ALL
                     </button>
                   </div>
+                </>
+              ) : (
+                <div className="queue-empty">
+                  <span>QUEUE EMPTY</span>
+                  <small>
+                    Upload audio untuk menambah track ke Queue.
+                  </small>
                 </div>
               )}
             </div>
@@ -1062,14 +1483,12 @@ function App() {
                 ? `PROCESSING ${
                     processingIndex + 1
                   }/${selectedFiles.length}`
-                : selectedFiles.length > 1
-                  ? "PROCESS ALL"
-                  : "PROCESS AUDIO"}
+                : `PROCESS QUEUE • ${selectedFiles.length}` }
 
               <span>{processing ? "…" : "→"}</span>
             </button>
 
-            {/* RESULTS */}
+            {/* QUEUE RESULTS */}
             {batchResults.length > 0 && !processing && (
               <div className="batch-results">
                 <div className="batch-results-header">
@@ -1081,15 +1500,25 @@ function App() {
                     </span>
                   </div>
 
-                  {hasDoneResults && (
-                    <button
-                      type="button"
-                      className="zip-button"
-                      onClick={downloadAllAsZip}
-                    >
-                      ↓ DOWNLOAD ALL ZIP
-                    </button>
-                  )}
+                  <div className="result-header-actions">
+                    {batchResults.some(
+                      (item) => item.status === "error"
+                    ) && (
+                      <span className="retry-hint">
+                        FAILED TRACKS CAN BE RETRIED
+                      </span>
+                    )}
+
+                    {hasDoneResults && (
+                      <button
+                        type="button"
+                        className="zip-button"
+                        onClick={downloadAllAsZip}
+                      >
+                        ↓ DOWNLOAD ALL ZIP
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="batch-results-list">
@@ -1121,6 +1550,19 @@ function App() {
                               : item.status.toUpperCase()}
                         </small>
                       </div>
+
+                      {item.status === "error" && (
+                        <button
+                          type="button"
+                          className="retry-button"
+                          onClick={() =>
+                            retryQueueItem(item.id)
+                          }
+                          disabled={processing}
+                        >
+                          RETRY
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
